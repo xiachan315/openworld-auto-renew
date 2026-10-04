@@ -1,0 +1,14 @@
+{
+  "name": "openworld-auto-renew",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Openworld VPS 自动续期（headless Chromium + Clerk cookie + GitHub Actions）",
+  "scripts": {
+    "renew": "node ow-auto-renew-daemon.mjs once",
+    "verify": "node ow-solver-verify.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "1.63.0"
+  }
+}

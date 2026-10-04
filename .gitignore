@@ -1,0 +1,7 @@
+node_modules/
+ow_cookies.json
+.env
+*.log
+ow-captcha-samples/
+ow-renew-tools/
+.deploy-tmp/
