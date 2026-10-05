@@ -468,10 +468,17 @@ export function solveGap(img, meta) {
   // ★ y 搜索区：用 meta.py 限定（实测 py±2 准确率 93.3%，全图只有 85%）。
   //   py 是服务端给的缺口上边缘 y 坐标，**每次都变**（实测 33/39/75…），
   //   是极强的免费先验。之前完全没用它，等于把 90% 的信息扔掉。
+  // ★ py 是强先验，但**缺失或不可信时必须退化到全图**，
+  //   否则 yLo==yHi 附近的搜索带里根本没有缺口 ⇒ 必然 NO_GAP_BLOB。
+  //   实测见过「3192 字节的极简背景 + 缺口未定位」= py 没对上。
+  const hasPy = meta.py !== undefined && meta.py !== null && Number.isFinite(Number(meta.py));
   const PY_R = 2;                       // 实测 ±2 最优，±4 掉到 26/30
-  const yLo = Math.max(0, Math.floor((Math.round(meta.py || 0) - PY_R) * sy));
-  const yHi = Math.min(img.h, Math.ceil((Math.round(meta.py || 0) + PY_R + ph) * sy));
-  const box = [x0, yLo, x1, yHi];
+  const py = Math.round(Number(meta.py) || 0);
+  const box = (hasPy && py >= 0 && py < mh)
+    ? [x0, Math.max(0, Math.floor((py - PY_R) * sy)),
+       x1, Math.min(img.h, Math.ceil((py + PY_R + ph) * sy))]
+    : [x0, 0, x1, img.h];               // 无 py ⇒ 全图搜
+  const usedPy = box[1] !== 0;
 
   // 试多个阈值分位，取「宽度最接近 pw」的连通块
   let best = null;
@@ -483,7 +490,16 @@ export function solveGap(img, meta) {
     if (err > pw * sx * 0.9) continue;          // 宽度偏差过大 => 不是缺口
     if (!best || err < best.err) best = { blob, bw, err, pct };
   }
-  if (!best) return { i: null, why: 'NO_GAP_BLOB' };
+  if (!best) {
+    // 诊断：把各阈值下的候选宽都记下来，判一眼是真没有还是全被宽度校验否掉
+    const probes = [];
+    for (const pct of [6, 10, 14, 18, 24]) {
+      const b = largestDarkBlob(img, box, pct);
+      probes.push(pct + '%:' + (b ? (b.maxX - b.minX) + 'px' : 'null'));
+    }
+    return { i: null, why: 'NO_GAP_BLOB', usedPy, hasPy, py, box,
+             pwPx: Math.round(pw * sx), probes };
+  }
 
   const gapLeft = best.blob.minX / sx;         // 缺口左缘的逻辑 x
   let value = Math.round(gapLeft);
@@ -491,6 +507,7 @@ export function solveGap(img, meta) {
   return {
     i: value, value, vmax,
     blob: { minX: best.blob.minX, maxX: best.blob.maxX, w: best.bw, size: best.blob.size, pct: best.pct },
+    usedPy, py, pwPx: Math.round(pw * sx),
     note: '缺口暗块定位(宽度校验)',
   };
 }

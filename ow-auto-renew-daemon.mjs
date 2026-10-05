@@ -572,6 +572,26 @@ async function doRenew(page) {
         } else switchFails = 0;
         continue;
       }
+      // ★ 低置信度门槛：**按 regime 分档**，不是一刀切 margin。
+      //   实测统计（owrun7/8 + Actions run#20）：
+      //     regime=color  → margin 0.90 / 1.02   （高置信，可答）
+      //     regime=shape  → margin 0.0009 ~ 0.076 （全是瞎猜，且 0.0087 重复 4 次 = 原地打转）
+      //   ⇒ shape 型低于阈值直接换题，别浪费提交；color 型不设门槛。
+      const MIN_MARGIN = Number(
+        process.env.OW_MIN_ODD_MARGIN ||
+        (sol.regime === 'shape' ? 0.15 : 0.02));
+      if (sol.margin !== undefined && sol.margin < MIN_MARGIN) {
+        rounds.push({ stage, kind, i: sol.i, margin: sol.margin,
+                      note: `低置信(${sol.margin}<${MIN_MARGIN})，换题` });
+        log(`  阶段${stage + 1} odd 置信度不足（margin=${sol.margin}），换题`);
+        const swOk = await switchKind(page);
+        if (swOk) switchFails = 0;
+        else if (++switchFails > 1) {
+          return { ok: false, why: 'SWITCH_DEAD', rounds,
+                   note: '换题按钮连续无效，重开会话重摇题型' };
+        }
+        continue;
+      }
       lastOdd = { i: sol.i, margin: sol.margin };
       await moveHuman(page, pt.x, pt.y);
       await page.mouse.click(pt.x, pt.y);
@@ -682,13 +702,17 @@ async function doRenew(page) {
         const cm = await page.evaluate(() => window.__owCapMeta || null);
         const sol = solveGap(img, { w: 300, h: 160, vmax: meta.vmax, pw, ph: pw,
                                     px: cm?.px, py: cm?.py });
+        // 诊断字段透传（solveGap 已在返回里带上）
         if (sol.i === null) {
           // ★ 这里原来自己实现了一套坐标点击，绕过了 switchKind 的
           //   三级回退（DOM click / locator.click / 坐标）与失败计数，
           //   结果「缺口未定位」时空转 40 阶段（实测 119 次 puzzle 全耗在这）。
           //   ⇒ 统一走 switchKind，止损交给 switchFails。
-          rounds.push({ stage, kind, skipped: 'no-gap-located', grabVia, grabBytes });
-          log(`  阶段${stage + 1} ${kind} 缺口未定位（via=${grabVia}, ${grabBytes}B），换题`);
+          // 带上 solveGap 的诊断字段（usedPy/py/probes/pwPx），一眼看出是没图还是没对上
+          rounds.push({ stage, kind, skipped: 'no-gap-located', grabVia, grabBytes,
+                        diag: sol.diag || null });
+          log(`  阶段${stage + 1} ${kind} 缺口未定位（via=${grabVia}, ${grabBytes}B, ` +
+              `usedPy=${sol.usedPy}, py=${sol.py}, pwPx=${sol.pwPx}, probes=${JSON.stringify(sol.probes)}），换题`);
           const swOk = await switchKind(page);
           if (swOk) switchFails = 0;
           else if (++switchFails > 1) {
