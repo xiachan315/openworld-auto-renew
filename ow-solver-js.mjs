@@ -20,7 +20,7 @@
 //   Node 自带 zlib，直接解 PNG 完全可靠，也省掉一次浏览器往返。
 import zlib from 'node:zlib';
 
-function decodePngBuffer(buf) {
+export function decodePngBuffer(buf) {
   const sig = [137, 80, 78, 71, 13, 10, 26, 10];
   for (let i = 0; i < 8; i++) if (buf[i] !== sig[i]) throw new Error('not a PNG');
   let off = 8, width = 0, height = 0, bitDepth = 0, colorType = 0, interlace = 0;

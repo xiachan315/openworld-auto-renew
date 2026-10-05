@@ -31,7 +31,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { decodePng, decodePngFromB64, solveOdd, solveGap, solveMatch, solveRotate, solveRotate2 } from './ow-solver-js.mjs';
+import { decodePng, decodePngFromB64, decodePngBuffer, solveOdd, solveGap, solveMatch, solveRotate, solveRotate2 } from './ow-solver-js.mjs';
 import { notify, formatResult } from './ow-telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -117,6 +117,57 @@ const grabTooSmall = (b64, kind) => {
   return sz.w < min || sz.h < minH;
 };
 
+/**
+ * ★★ 图像信息量判据（2026-10-05 Actions run#22 实测发现的关键漏洞）。
+ *
+ * 事实：`grabBytes=3360` 的背景图**解码后仍然是 300x160**，
+ *   因为「几乎纯色」的 PNG 压缩率极高 —— 只看宽高会**完全放过**它。
+ *   后果：`solveGap` 在空白图上找到的"最宽暗块"是 260~277px，
+ *   而期望的拼块宽只有 95px（`probes` 与 `pwPx` 一对比就露馅），
+ *   ⇒ 缺口定位必然失败 ⇒ 反复换题 ⇒ 预算耗尽 ⇒ SWITCH_DEAD。
+ *
+ * 判据：**灰度的标准差**。
+ *   · 空白/纯色图 ⇒ 所有像素同值 ⇒ std ≈ 0
+ *   · 真实题目图（含草地/水域/图形/描边）⇒ std 明显 > 0
+ * 只采样像素（每 N 个取一个）够用，不必完整解码。
+ */
+function imageInfoScore(b64, maxSamples = 1200) {
+  const sz = pngSize(b64);
+  if (!sz) return null;
+  let img;
+  try {
+    img = decodePngBuffer(Buffer.from(b64, 'base64'));
+  } catch (e) { return null; }
+  // ⚠️ decodePngBuffer 返回的是 `{ w, h, data }`（data 是普通数组 Array.from），
+  //    **不是** { width, height }。我一开始按 width/height 取 ⇒ 全部 undefined。
+  const w = img.w, h = img.h, data = img.data;
+  if (!w || !h || !data || data.length < w * h) return null;
+  const total = w * h;
+  const step = Math.max(1, Math.floor(total / maxSamples));
+  let n = 0, sum = 0, sum2 = 0, min = 255, max = 0;
+  for (let i = 0; i < total; i += step) {
+    const o = i * 4;
+    if (o + 2 >= data.length) break;
+    const l = data[o] * 0.299 + data[o + 1] * 0.587 + data[o + 2] * 0.114;
+    sum += l; sum2 += l * l; n++;
+    if (l < min) min = l;
+    if (l > max) max = l;
+  }
+  if (n < 10) return null;
+  const mean = sum / n;
+  const std = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+  return { std: Math.round(std * 10) / 10, range: Math.round(max - min), n, w, h };
+}
+
+/** 背景图「太单调」⇒ 抓到了空白/半渲染（像素尺寸正常但内容空） */
+const grabTooFlat = (b64, kind) => {
+  if (kind === 'chip') return false;           // chip 可能本身就很单调
+  const info = imageInfoScore(b64);
+  if (!info) return true;                       // 解不出信息 ⇒ 视为空
+  // 实测：真实题目图 std 明显大于 20；空白图接近 0
+  return info.std < 12 || info.range < 60;
+};
+
 const ready = (page) => page.evaluate(() => {
   const bg = document.getElementById('captcha_bg_default');
   const st = document.getElementById('captcha_status_default');
@@ -155,6 +206,10 @@ const readState = (page) => page.evaluate(() => {
     tokenLen: (tk?.value || '').length,
     verified: dn ? getComputedStyle(dn).display !== 'none' : false,
     canSwitch: !!g('captcha_switch_default')?.offsetParent,
+    // 挑战 ID（服务端下发，换题必变）。
+    // ★ 重复判定必须带上它：rotate 答案恒为 0，只用 kind+target 会把
+    //   **每张新图**都误判成重复（实测 10 次 rotate 里 7 次是假重复）。
+    capId: (window.__owCapMeta && window.__owCapMeta.id) || null,
   };
 });
 
@@ -529,6 +584,7 @@ async function doRenew(page) {
   const rounds = [];
   let st = await readState(page);
   let keySwitches = 0;
+  let rotateSameFig = 0;
   let switchFails = 0;
   let grabVia = null;
   let grabBytes = 0;
@@ -573,14 +629,18 @@ async function doRenew(page) {
     // ★ 二次校验：PNG 头里的宽高必须够大。
     //   实测（run#20）：半渲染时截到 3360 字节的背景图，解码后尺寸不足 ⇒ 求解器必错。
     //   元素截图本身不报错，只能靠**尺寸**判断抓到了空图。
-    if (grabTooSmall(png.b64, 'bg')) {
+    if (grabTooSmall(png.b64, 'bg') || grabTooFlat(png.b64, 'bg')) {
       grabRetry++;
-      log(`  阶段${stage + 1} 抓到空图（${grabBytes}B，重试 ${grabRetry}/3），重等就绪`);
-      await page.waitForTimeout(1000);
+      const info = imageInfoScore(png.b64) || {};
+      log(`  阶段${stage + 1} 抓到空图（${grabBytes}B, std=${info.std}, range=${info.range}` +
+          `，重试 ${grabRetry}/3），重等就绪`);
+      await page.waitForTimeout(1200);
       if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds, grabRetry };
       png = await grabPng(page);
-      if (png.err || grabTooSmall(png.b64, 'bg')) {
-        return { ok: false, why: 'GRAB_EMPTY', rounds, grabRetry, grabVia };
+      if (png.err || grabTooSmall(png.b64, 'bg') || grabTooFlat(png.b64, 'bg')) {
+        const i2 = imageInfoScore(png.b64) || {};
+        return { ok: false, why: 'GRAB_EMPTY', rounds, grabRetry, grabVia,
+                 bytes: i2, note: `像素尺寸正常但内容单调（std=${i2.std}），判定为空白图` };
       }
       grabVia = png.via || '?';
       grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
@@ -621,9 +681,13 @@ async function doRenew(page) {
       //     regime=color  → margin 0.90 / 1.02   （高置信，可答）
       //     regime=shape  → margin 0.0009 ~ 0.076 （全是瞎猜，且 0.0087 重复 4 次 = 原地打转）
       //   ⇒ shape 型低于阈值直接换题，别浪费提交；color 型不设门槛。
-      const MIN_MARGIN = Number(
-        process.env.OW_MIN_ODD_MARGIN ||
-        (sol.regime === 'shape' ? 0.15 : 0.02));
+      // ⚠️ 阈值必须**数据驱动**。我先后拍过 0.06 / 0.15 两个值，
+      //   统计全部历史 margin（shape 型）后看到真实分布是：
+      //     0.011 / 0.021 / 0.076 / 0.279 / 0.281
+      //   ⇒ 0.15 落在 0.076 与 0.279 中间，但**没有任何证据**说这里该切。
+      //   现在用 0.05：只拦「几乎并列」（最差那几个），放过 0.076+ 的中档。
+      //   宁可多试一次（换题不要钱），也不要因为过严门槛白耗换题预算。
+      const MIN_MARGIN = Number(process.env.OW_MIN_ODD_MARGIN || 0.05);
       if (sol.margin !== undefined && sol.margin < MIN_MARGIN) {
         rounds.push({ stage, kind, i: sol.i, margin: sol.margin,
                       note: `低置信(${sol.margin}<${MIN_MARGIN})，换题` });
@@ -863,20 +927,38 @@ async function doRenew(page) {
           await trackTo(cur + err);          // 按误差比例直接跳
           cur = await readVal();
         }
-        // ★ 与 odd 同理：拖拽类题型答错时服务端不会换题，
-        //   脚本在同一张图上重试就是死循环（实测 run#4：171 chip→24 重复 20 次）。
-        //   判据：目标 value 相同 ⇒ 同一张图同一定位 ⇒ 换题；连续 3 次则放弃本轮。
-        const sig = `${kind}:${target}`;
+        // ★★ 修正（2026-10-05 run#11）：判据必须**包含 meta.id**。
+        //   原来只用 `kind:target`，而 rotate 的答案**恒为 0**（chip 是绿色圆球，
+        //   缺口恒在正上方 ⇒ 转 0° 就对；实测 solveRotate2 返回 iou=0.337 找对了），
+        //   于是**每张新图都被判"重复"** ⇒ rotate 出现 10 次、7 次是假重复。
+        //   ⇒ 用 `kind:meta.id:target`：只有**同一张图**算出同一答案才算重复。
+        const sig = `${kind}:${st.capId || 'na'}:${target}`;
         if (lastPuzzle === sig) {
-          rounds.push({ stage, kind, value: target, note: '定位重复，换题' });
-          log(`  阶段${stage + 1} ${kind} 定位重复，换题`);
-          const swOk = await switchKind(page);
-          if (swOk) switchFails = 0;
-          else if (++switchFails > 1) {
-            return { ok: false, why: 'SWITCH_DEAD', rounds,
-                     note: '换题按钮连续无效，重开会话重摇题型' };
+          // ★ rotate 的答案天然固定（0°），且圆形 chip 旋转后形状不变 ⇒
+          //   **在旋转到位之前**，反复提交 0° 本身就是合理的重试，
+          //   不该立刻换题（换题预算每会话只有 5 次，很宝贵）。
+          //   ⇒ rotate 允许同一张图内重试 3 次，超过才换题。
+          //   其他题型（puzzle 的缺口位置每次都不同）保持「一次重复就换」。
+          const sameFigRetry = (rotateSameFig = rotateSameFig || 0) + 1;
+          const ROTATE_MAX_RETRY = 3;
+          if (!(kind === 'rotate' && sameFigRetry <= ROTATE_MAX_RETRY)) {
+            rounds.push({ stage, kind, value: target, note: '定位重复，换题',
+                          sameFigRetry });
+            log(`  阶段${stage + 1} ${kind} 定位重复（第 ${sameFigRetry} 次），换题`);
+            const swOk = await switchKind(page);
+            if (swOk) switchFails = 0;
+            else if (++switchFails > 1) {
+              return { ok: false, why: 'SWITCH_DEAD', rounds,
+                       note: '换题按钮连续无效，重开会话重摇题型' };
+            }
+            rotateSameFig = 0;
+            continue;
+          } else {
+            // rotate 同图重试（预算宝贵，别浪费）
+            log(`  阶段${stage + 1} rotate 同图重试 ${sameFigRetry}/${ROTATE_MAX_RETRY}`);
           }
-          continue;
+        } else {
+          rotateSameFig = 0;
         }
         lastPuzzle = sig;
 
