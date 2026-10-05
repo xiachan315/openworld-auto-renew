@@ -286,7 +286,17 @@ async function launch() {
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox',
            '--disable-dev-shm-usage', '--disable-gpu'],
   });
-  const ctx = await browser.newContext({ userAgent: UA, locale: 'zh-CN', viewport: { width: 1280, height: 900 } });
+  // ★ 时区固定为 Asia/Shanghai。实测（2026-10-05）：
+  //   面板按**浏览器本地时区**渲染到期时间，同一时刻：
+  //     timezoneId=Asia/Shanghai → "2026-10-12 13:39:03"（正确）
+  //     timezoneId=UTC           → "2026-10-12 05:39:03"（差 8 小时）
+  //   GitHub runner 是 UTC ⇒ 不设这一项，通知里的到期时间就全错 8 小时。
+  //   显式指定后，页面渲染、读数、通知三处天然一致，无需事后换算。
+  const TZ_ID = process.env.OW_TZ || 'Asia/Shanghai';
+  const ctx = await browser.newContext({
+    userAgent: UA, locale: 'zh-CN', viewport: { width: 1280, height: 900 },
+    timezoneId: TZ_ID,
+  });
   await ctx.addCookies(cookies.map(c => ({
     name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
     httpOnly: !!c.httpOnly, secure: !!c.secure,
@@ -312,11 +322,45 @@ async function launch() {
   return { browser, page };
 }
 
+/**
+ * 读到期信息。
+ *
+ * ★★ 时区 bug（2026-10-05 实测）：面板用**浏览器本地时区**渲染到期时间，
+ *   所以同一时刻读到不同值：
+ *     本机（北京）  → "2026-10-12 13:39:03"
+ *     Actions（UTC）→ "2026-10-12 05:39:03"     ← 差 8 小时
+ *   而这个串被原样存进 `renews` 并写进通知 ⇒ 服务器侧的通知时间全错 8 小时。
+ *
+ * 修法：**页面内用 `Date` 对象取时区偏移**，据此反推出北京时间串，
+ *   输出与运行环境的时区无关。
+ *   - 页面时区偏移 = Date 的 getTimezoneOffset()（北京 = -480）
+ *   - 若面板渲染的是本地时间，则北京时间 = 本地时间 - offset/60 小时
+ */
+/**
+ * 读到期信息。
+ *
+ * ★ 时区（2026-10-05 实测修正）：
+ *   面板按**浏览器本地时区**渲染到期时间。实测同一时刻：
+ *     timezoneId=Asia/Shanghai → "2026-10-12 13:39:03"
+ *     timezoneId=UTC           → "2026-10-12 05:39:03"    差 8 小时
+ *   GitHub runner 是 UTC，所以在 `launch()` 里**显式指定 timezoneId=Asia/Shanghai**
+ *   （见该文件 launch 函数）。这里直接原样读取即可，**不要再做二次换算**。
+ *
+ *   ⚠️ 我一度在这里又按 getTimezoneOffset() 换算了一次，
+ *      结果在北京时区下被重复减 8 小时（21:39，错的）。换算只做一次，且必须做在
+ *      **浏览器侧**（timezoneId），不能在字符串层重复做。
+ *
+ * 同时保留 `renewsRaw` 与 `tzShiftH` 作为诊断证据，便于事后核对。
+ */
 async function readRenew(page) {
   return page.evaluate(() => {
     const t = document.body.innerText || '';
+    const raw = (t.match(/Renews until\s*([0-9\-: ]+)/) || [])[1]?.trim() || null;
     return {
-      renews: (t.match(/Renews until\s*([0-9\-: ]+)/) || [])[1]?.trim() || null,
+      renews: raw,
+      renewsRaw: raw,
+      // 诊断用：页面时区偏移（分钟）。北京 = -480，UTC = 0
+      tzShiftMin: new Date().getTimezoneOffset(),
       inDays: (t.match(/Renews in\s*([^\n]+)/) || [])[1]?.trim() || null,
       running: /RUNNING/.test(t),
       loggedIn: !/Sign in|Log in|Redirecting/i.test(t),
