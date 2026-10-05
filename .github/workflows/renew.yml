@@ -2,10 +2,18 @@ name: Openworld 自动续期
 
 on:
   schedule:
-    # 每 2 小时跑一次。脚本内部有 72h 阈值：不到窗口期就只读跳过（不消耗任何配额）。
-    # 提频原因：验证码 key 题型解不出（KEY_STUCK），靠多次重试碰可解题型。
+    # 每天一次（北京 08:23），不要加密频率。
+    #
+    # ★ 平台有「24h 冷却」：每 24h 只能成功续 1 次。
+    #   加密 cron（如每 2h）**不会增加成功次数**，只会让 3/4 的运行被服务端拒绝，
+    #   纯粹浪费 runner 时间。
+    #   正确策略 = 每天有效试 1 次 × 7 天 = 7 次机会。
+    #   题型在 5 种里随机，已通 4 种 ⇒ 单次成功率 4/5
+    #   ⇒ 7 次全败概率 = (1/5)^7 = 0.0013%
+    #
+    # 阈值 72h：到期前 3 天开始尝试，避开「续期成功但冷却未过导致误判」。
     # 平台规则「每 24h 可免费续 1 次」，所以一天最多成功续一次，多跑几次只是读状态。
-    - cron: '17 */2 * * *'
+    - cron: '23 8 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -23,7 +31,7 @@ concurrency:
 jobs:
   renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       # Clerk 会话 cookie（base64 的 JSON 数组）。在 repo 的
       # Settings -> Secrets and variables -> Actions 里加名为 OW_COOKIES_B64 的 secret。
