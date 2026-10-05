@@ -93,12 +93,48 @@ Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
 const log = (...a) => console.log(new Date().toISOString().slice(0, 19), ...a);
 
 // ---------- 验证码相关 ----------
+/** 从 PNG 的 IHDR 直接读宽高（不做完整解码，便宜） */
+function pngSize(b64) {
+  if (!b64 || b64.length < 32) return null;
+  try {
+    const buf = Buffer.from(b64, 'base64');
+    if (buf.length < 24 || buf.toString('ascii', 1, 4) !== 'PNG') return null;
+    return { w: buf.readUInt32BE(16), h: buf.readUInt32BE(20) };
+  } catch (e) { return null; }
+}
+
+/**
+ * 抓到的图太小 ⇒ 截到了空白/半渲染。
+ * ⚠️ 阈值必须**分类型**：背景图 300x160，但 chip 只有 72x72（实测）
+ *   ⇒ 一刀切 100x60 会把 chip 误判为空图。
+ *   用 `minSide`：背景 100，chip 40。
+ */
+const grabTooSmall = (b64, kind) => {
+  const sz = pngSize(b64);
+  if (!sz) return true;                        // 不是合法 PNG
+  const min = (kind === 'chip') ? 40 : 100;
+  const minH = (kind === 'chip') ? 40 : 60;
+  return sz.w < min || sz.h < minH;
+};
+
 const ready = (page) => page.evaluate(() => {
   const bg = document.getElementById('captcha_bg_default');
   const st = document.getElementById('captcha_status_default');
-  return !!(bg && bg.src && bg.src.startsWith('blob:') &&
-            getComputedStyle(bg).display === 'block' &&
-            st && getComputedStyle(st).display === 'none');
+  if (!bg || !bg.src || !bg.src.startsWith('blob:')) return false;
+  if (getComputedStyle(bg).display !== 'block') return false;
+  if (!st || getComputedStyle(st).display !== 'none') return false;
+  // ★ 必须**解码完成且有实际尺寸**。
+  //   实测（Actions run#20）：bg.src 已就位但 complete=false 时就截图，
+  //   抓到的是空白/半渲染 ⇒ 只有 3360 字节（正常 37239）⇒ 求解器必然失败，
+  //   随后 waitReady 也过不去 ⇒ 整轮 NOT_READY。
+  //   naturalWidth/Height 是解码完成的硬判据。
+  if (!bg.complete) return false;
+  const nw = bg.naturalWidth || 0, nh = bg.naturalHeight || 0;
+  if (nw < 100 || nh < 60) return false;
+  // 顺带确认渲染宽度与自然宽度比例合理（避免 display:block 但尺寸为 0）
+  const r = bg.getBoundingClientRect();
+  if (r.width < 100 || r.height < 40) return false;
+  return true;
 });
 
 async function waitReady(page, max = 25, gap = 500) {
@@ -490,7 +526,26 @@ async function doRenew(page) {
     //                'eval' = 页面内 fetch blob（超过上限会被静默截断）
     grabVia = png.via || '?';
     grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
+    // ★ 二次校验：PNG 头里的宽高必须够大。
+    //   实测（run#20）：半渲染时截到 3360 字节的背景图，解码后尺寸不足 ⇒ 求解器必错。
+    //   元素截图本身不报错，只能靠**尺寸**判断抓到了空图。
+    if (grabTooSmall(png.b64, 'bg')) {
+      grabRetry++;
+      log(`  阶段${stage + 1} 抓到空图（${grabBytes}B，重试 ${grabRetry}/3），重等就绪`);
+      await page.waitForTimeout(1000);
+      if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds, grabRetry };
+      png = await grabPng(page);
+      if (png.err || grabTooSmall(png.b64, 'bg')) {
+        return { ok: false, why: 'GRAB_EMPTY', rounds, grabRetry, grabVia };
+      }
+      grabVia = png.via || '?';
+      grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
+    }
     const img = await decodePng(page, png.b64);
+    if (!img || img.w < 100 || img.h < 60) {   // img 是背景图（300x160）
+      return { ok: false, why: 'IMG_TOO_SMALL', rounds, grabVia, grabBytes,
+               imgSize: img ? [img.w, img.h] : null };
+    }
 
     if (kind === 'odd') {
       const sol = solveOdd(img, GRID, 300, 160);
@@ -563,12 +618,17 @@ async function doRenew(page) {
         let r2 = { i: null, why: 'no-chip' };
         if (chipPng) {
           try {
-            const chipImg = decodePngFromB64(chipPng);
-            const cm = meta.cm || {};
-            r2 = solveRotate2(chipImg, img, {
-              vmax: cm.vmax || meta.vmax, ow: cm.ow, oh: cm.oh,
-              ox: cm.ox, oy: cm.oy,
-            });
+            // chip 只有 72x72（实测），阈值与背景图不同
+            if (grabTooSmall(chipPng, 'chip')) {
+              r2 = { i: null, why: 'chip-empty(' + (pngSize(chipPng)?.w || 0) + 'px)' };
+            } else {
+              const chipImg = decodePngFromB64(chipPng);
+              const cm = meta.cm || {};
+              r2 = solveRotate2(chipImg, img, {
+                vmax: cm.vmax || meta.vmax, ow: cm.ow, oh: cm.oh,
+                ox: cm.ox, oy: cm.oy,
+              });
+            }
           } catch (e) {
             // chip 的 blob 可能还没换成新题（src 仍是旧图或空）⇒ 换题重来
             r2 = { i: null, why: 'chip-decode:' + String(e.message).slice(0, 40) };
