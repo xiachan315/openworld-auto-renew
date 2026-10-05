@@ -949,13 +949,13 @@ async function doRenew(page) {
         //   ⇒ 用 `kind:meta.id:target`：只有**同一张图**算出同一答案才算重复。
         const sig = `${kind}:${st.capId || 'na'}:${target}`;
         if (lastPuzzle === sig) {
-          // ★ rotate 的答案天然固定（0°），且圆形 chip 旋转后形状不变 ⇒
-          //   **在旋转到位之前**，反复提交 0° 本身就是合理的重试，
-          //   不该立刻换题（换题预算每会话只有 5 次，很宝贵）。
-          //   ⇒ rotate 允许同一张图内重试 3 次，超过才换题。
-          //   其他题型（puzzle 的缺口位置每次都不同）保持「一次重复就换」。
+          // ★ rotate 只允许同一张图重试 1 次。
+          //   实测：rotate 的 chip 已经叠在缺口上，value=0 通常就是正确答案
+          //   （成功那次 owrun7：`rotate value=0 chip→0 STAGE 2/6` —— stage 推进了）。
+          //   若这次仍不推进，说明该题缺口方向不是 0°，而主轴法 aniso=0.027 算不出角度
+          //   ⇒ 立刻换题，别纠缠（owrun14 里 rotate 吃了 16 阶段耗尽预算 → KEY_STUCK）。
           const sameFigRetry = (rotateSameFig = rotateSameFig || 0) + 1;
-          const ROTATE_MAX_RETRY = 3;
+          const ROTATE_MAX_RETRY = 1;
           if (!(kind === 'rotate' && sameFigRetry <= ROTATE_MAX_RETRY)) {
             rounds.push({ stage, kind, value: target, note: '定位重复，换题',
                           sameFigRetry });
@@ -968,10 +968,16 @@ async function doRenew(page) {
             }
             rotateSameFig = 0;
             continue;
-          } else {
-            // rotate 同图重试（预算宝贵，别浪费）
-            log(`  阶段${stage + 1} rotate 同图重试 ${sameFigRetry}/${ROTATE_MAX_RETRY}`);
-          }
+        } else {
+          // ★ rotate 只重试 1 次就换题。
+          //   实测（2026-10-05）：rotate 的 chip 已经叠在缺口上，**value=0 就是正确答案**
+          //   （成功那次 owrun7：`rotate value=0 chip→0 STAGE 2/6` —— stage 推进了）。
+          //   若提交后 stage 没前进，说明该题缺口方向不是 0°，而我的主轴法实测
+          //   aniso=0.027（台灯太短胖）根本算不出角度。
+          //   ⇒ **不要在同一张图上纠缠**：owrun14 里 rotate 吃了 16 个阶段、
+          //     耗尽换题预算直接导致 KEY_STUCK。一次不行立刻换题。
+          log(`  阶段${stage + 1} rotate 同图再试 1 次（若仍不行就换题）`);
+        }
         } else {
           rotateSameFig = 0;
         }
@@ -1017,7 +1023,7 @@ async function doRenew(page) {
         }
         rounds.push({ stage, kind, value: target, vmax: meta.vmax, via: 'track+scan',
                       chipNow: cur, stageAfter: stNow.stage, tokenLen: stNow.tokenLen,
-                      grabVia, grabBytes });
+                      grabVia, grabBytes, capId: st.capId });
         log(`  阶段${stage + 1} ${kind} value=${target} chip→${cur} ${stNow.stage}` +
             (stNow.tokenLen > 0 ? ' ★token' : ''));
       } else {

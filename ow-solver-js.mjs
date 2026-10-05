@@ -770,24 +770,34 @@ export function solveKey(bgImg, chipImg, meta) {
 /**
  * rotate 题：把 chip 旋转到与背景缺口对齐。
  *
- * ★★ 2026-10-05 重写。旧版用「二阶矩主轴角」判定，**对圆形 chip 完全无效**：
- *   实测 chip 是「红色圆 + 左侧黑色折线」（截图确认），主体圆形 ⇒ 各向异性 aniso≈0
- *   ⇒ 主轴角 theta 由像素噪声决定 ⇒ **每张图都返回同一个 90**
- *   （日志实测 `rotate value=90 chip→90` 恒定）。
+ * ★★★ 2026-10-05 重写（第三版）。前两版都错在**用错了对象**：
  *
- * 正确信息源（全部来自 meta，零猜测）：
- *   ow/oh = 缺口框尺寸（实测 72x72）
- *   ox/oy = 缺口框中心
- *   vmax  = 359（角度范围，value 即 CSS rotate 的度数）
+ * 目视实测（`rot_ans_bg.png` / `rotA3_chip.png`）：
+ *   背景 = 一条**虚线圆环缺口**；chip = **红色圆球 + 旁边的黑色折线**。
+ *   DOM 实测：`chipRect.x=177 === meta.ox=177`、`y=37 ≈ meta.oy=36`
+ *   ⇒ **chip 已经叠在缺口上了**，`left/top` 是位置，`transform: rotate()` 才是旋转。
  *
- * 判据：缺口区域（bg 的 ox/oy/ow/oh 框）与 chip 的**形状轮廓**做相关匹配，
- *   取 0..359 中使轮廓重合度最高的角。
- *   实现：极坐标采样 —— 把 chip 掩码与 bg 缺口区都转成 72x72，
- *   对每个候选角度旋转 chip（最近邻），算 IoU，取最大。
- *   72x72 × 360 个角度在纯 JS 下约 190 万次采样，可接受（<1s）。
+ * 关键量测（真实数据）：
+ *   redC = (17,39)   ← 球心
+ *   darkC = (38,53)  ← 暗色折线质心
+ *   ⇒ 折线相对球心偏移 (21,14)，**角度 34°**
+ *   ⇒ chip **不是轴对称图形**，旋转后暗部分指向不同方向
+ *
+ * 前两版为何失败：
+ *   ① 二阶矩主轴（v1）：chip 主体是圆 ⇒ aniso≈0 ⇒ 角度由噪声决定 ⇒ 恒返回 90
+ *   ② 整个 chip 掩码 vs 缺口 Otsu 掩码的极坐标 IoU（v2）：
+ *      **把红球和折线混成一个 blob**，球是旋转不变的 ⇒ 任何角度 IoU 都差不多
+ *      ⇒ 实测 iou=0.337, margin=0（多角度并列），等于瞎猜
+ *
+ * 现在（v3）：**只用暗色折线部分**
+ *   1) chip 内分两类像素：红色球（高 R、低 G/B）、暗色折线（低亮度）
+ *   2) 各自求质心 ⇒ 得到折线相对球心的**方向向量**
+ *   3) 背景缺口框内用 Otsu 分出**暗色标记**（虚线圆环比背景暗）
+ *   4) 缺口标记相对**缺口中心**的方向向量
+ *   5) 答案 = 把 (1) 的方向转到 (4) 的方向所需的 CSS 角度
  *
  * @param chipImg  chip 帧（RGBA）
- * @param bgImg   背景帧（RGBA）—— 缺路口在它里面
+ * @param bgImg   背景帧（RGBA）
  * @param meta    { ow, oh, ox, oy, vmax }
  */
 export function solveRotate2(chipImg, bgImg, meta = {}) {
@@ -797,117 +807,117 @@ export function solveRotate2(chipImg, bgImg, meta = {}) {
   if (!bg || !bg.data) return { i: null, why: 'NO_BG_IMG' };
 
   const vmax = meta.vmax || 359;
-  const ow = Math.round(meta.ow || 72), oh = Math.round(meta.oh || 72);
-  const ox = Math.round(meta.ox || 0), oy = Math.round(meta.oy || 0);
 
-  // ---- 1) chip 掩码（alpha > 128），缩放到 ow x oh ----
-  const cw = ow, chh = oh;
-  const chipMask = new Uint8Array(cw * chh);
-  const sx = chip.w / cw, sy = chip.h / chh;
-  for (let y = 0; y < chh; y++) {
-    for (let x = 0; x < cw; x++) {
-      const gx = Math.min(chip.w - 1, Math.floor(x * sx));
-      const gy = Math.min(chip.h - 1, Math.floor(y * sy));
-      chipMask[y * cw + x] = chip.data[(gy * chip.w + gx) * 4 + 3] > 128 ? 1 : 0;
+  // ---------- 1) chip：分「红球」与「暗折线」两类像素 ----------
+  // 阈值收紧：红球要「明确红」，暗色要「明确暗」。
+  // ⚠️ 我第一版用 R<110 当暗色，结果把红球的**暗边/阴影**也算进折线，
+  //   实测 markVec=[2,17] 而目视量的是 [21,14] ⇒ 方向被污染。
+  const RED_R = 150, RED_GMAX = 110;
+  const DARK_MAX = 90;
+  let rSx = 0, rSy = 0, rN = 0;          // 红球
+  let dSx = 0, dSy = 0, dN = 0;          // 暗折线
+  for (let y = 0; y < chip.h; y++) {
+    for (let x = 0; x < chip.w; x++) {
+      const i = (y * chip.w + x) * 4;
+      if (chip.data[i + 3] < 200) continue;      // 只要基本不透明
+      const R = chip.data[i], G = chip.data[i + 1], B = chip.data[i + 2];
+      if (R > RED_R && G < RED_GMAX && B < RED_GMAX) { rSx += x; rSy += y; rN++; }
+      else if (R < DARK_MAX && G < DARK_MAX && B < DARK_MAX) { dSx += x; dSy += y; dN++; }
     }
   }
+  // 红球没找到就用 chip 质心兜底；暗折线必须有
+  const ball = rN >= 20 ? { x: rSx / rN, y: rSy / rN, n: rN }
+                        : { x: chip.w / 2, y: chip.h / 2, n: 0 };
+  if (dN < 20) return { i: null, why: 'CHIP_NO_MARK', ballN: ball.n, darkN: dN };
 
-  // ---- 2) 缺口掩码：从 bg 的 (ox,oy,ow,oh) 框里取「非背景」像素 ----
-  // bg 与 chip 同坐标系（逻辑 300x160）；按比例映射到像素
+  // ★ 第二步：只取「离球心足够远」的暗像素算折线质心。
+  //   球心附近的暗像素是球的阴影/描边，会把方向拉偏；
+  //   真正的折线在球的外侧。距离阈值 = 球半径的 0.9 倍（实测 r≈14 ⇒ 12px）。
+  const ballR = Math.sqrt((rN || 1) / Math.PI);
+  const minDist = Math.max(6, ballR * 0.9);
+  let mSx = 0, mSy = 0, mN = 0;
+  for (let y = 0; y < chip.h; y++) {
+    for (let x = 0; x < chip.w; x++) {
+      const i = (y * chip.w + x) * 4;
+      if (chip.data[i + 3] < 200) continue;
+      const R = chip.data[i], G = chip.data[i + 1], B = chip.data[i + 2];
+      if (!(R < DARK_MAX && G < DARK_MAX && B < DARK_MAX)) continue;
+      const dx = x - ball.x, dy = y - ball.y;
+      if (Math.hypot(dx, dy) < minDist) continue;      // 球自身的暗边，跳过
+      mSx += x; mSy += y; mN++;
+    }
+  }
+  if (mN < 10) return { i: null, why: 'CHIP_MARK_TOO_CLOSE', ballR: Math.round(ballR),
+                       minDist: Math.round(minDist), mN };
+  const mark = { x: mSx / mN, y: mSy / mN, n: mN };
+
+  // 折线相对球心的方向向量（图像坐标，y 向下）
+  const mvx = mark.x - ball.x, mvy = mark.y - ball.y;
+  const mlen = Math.hypot(mvx, mvy);
+  if (mlen < 2) return { i: null, why: 'CHIP_MARK_CENTERED', mlen: Math.round(mlen) };
+
+  // ---------- 2) 背景：缺口框内用 Otsu 分出暗标记 ----------
+  const ow = Math.round(meta.ow || 72), oh = Math.round(meta.oh || 72);
+  const ox = Math.round(meta.ox || 0), oy = Math.round(meta.oy || 0);
   const bw = bg.w, bh = bg.h;
-  const metaW = 300, metaH = 160;
-  const bsx = bw / metaW, bsy = bh / metaH;
+  const bsx = bw / 300, bsy = bh / 160;
   const x0 = Math.max(0, Math.floor(ox * bsx)), x1 = Math.min(bw, Math.ceil((ox + ow) * bsx));
   const y0 = Math.max(0, Math.floor(oy * bsy)), y1 = Math.min(bh, Math.ceil((oy + oh) * bsy));
-  if (x1 - x0 < 8 || y1 - y0 < 8) return { i: null, why: 'GAP_BOX_TOO_SMALL' };
+  if (x1 - x0 < 10 || y1 - y0 < 10) return { i: null, why: 'GAP_BOX_TOO_SMALL' };
 
-  // 缺口 = 框内「与框边缘明显不同」的像素。用 Otsu 阈值分离。
   const boxW = x1 - x0, boxH = y1 - y0;
   const lum = new Float32Array(boxW * boxH);
-  let lmin = 1e9, lmax = -1e9;
   for (let y = 0; y < boxH; y++) {
     for (let x = 0; x < boxW; x++) {
       const i = ((y0 + y) * bw + (x0 + x)) * 4;
-      const l = bg.data[i] * 0.299 + bg.data[i + 1] * 0.587 + bg.data[i + 2] * 0.114;
-      lum[y * boxW + x] = l;
-      if (l < lmin) lmin = l;
-      if (l > lmax) lmax = l;
+      lum[y * boxW + x] = bg.data[i] * 0.299 + bg.data[i + 1] * 0.587 + bg.data[i + 2] * 0.114;
     }
   }
-  // Otsu
+  // Otsu 阈值（框内双峰分离）
   const hist = new Float64Array(256);
   for (let k = 0; k < lum.length; k++) hist[Math.max(0, Math.min(255, Math.round(lum[k])))]++;
   const total = lum.length;
   let sumAll = 0;
   for (let t = 0; t < 256; t++) sumAll += t * hist[t];
-  let sumB = 0, wB = 0, best = 0, bestT = 128;
+  let sumB = 0, wB = 0, best = 0, thr = 128;
   for (let t = 0; t < 256; t++) {
     wB += hist[t]; if (!wB) continue;
     const wF = total - wB; if (!wF) break;
     sumB += t * hist[t];
-    const mB = sumB / wB, mF = (sumAll - sumB) / wF;
-    const between = wB * wF * (mB - mF) * (mB - mF);
-    if (between > best) { best = between; bestT = t; }
+    const between = wB * wF * ((sumB / wB) - ((sumAll - sumB) / wF)) ** 2;
+    if (between > best) { best = between; thr = t; }
   }
-  // 缺口掩码：缩放到 cw x chh
-  const gapMask = new Uint8Array(cw * chh);
-  const gsx = boxW / cw, gsy = boxH / chh;
-  for (let y = 0; y < chh; y++) {
-    for (let x = 0; x < cw; x++) {
-      const gx = Math.min(boxW - 1, Math.floor(x * gsx));
-      const gy = Math.min(boxH - 1, Math.floor(y * gsy));
-      gapMask[y * cw + x] = lum[gy * boxW + gx] < bestT ? 1 : 0;
+  // 暗标记质心（相对缺口框中心）
+  let gSx = 0, gSy = 0, gN = 0;
+  for (let y = 0; y < boxH; y++) {
+    for (let x = 0; x < boxW; x++) {
+      if (lum[y * boxW + x] < thr) { gSx += x; gSy += y; gN++; }
     }
   }
+  if (gN < 15) return { i: null, why: 'GAP_NO_MARK', thr, gapDarkN: gN };
+  const gapC = { x: gSx / gN, y: gSy / gN };
+  // 缺口中心（像素）
+  const cx = boxW / 2, cy = boxH / 2;
+  const gvx = gapC.x - cx, gvy = gapC.y - cy;
+  const glen = Math.hypot(gvx, gvy);
 
-  // ---- 3) 极坐标 IoU：chip 掩码绕中心旋转 0..vmax 度，与 gapMask 比 ----
-  const cx = (cw - 1) / 2, cy = (chh - 1) / 2;
-  const half = Math.min(cw, chh) / 2;
-  // 预采样 chip 掩码的极坐标（角度 × 半径）
-  const NA = 180, NR = 36;                    // 180 方向 × 36 半径
-  const polar = new Float32Array(NA * NR);
-  const cosT = new Float32Array(NA), sinT = new Float32Array(NA);
-  for (let a = 0; a < NA; a++) {
-    const th = (a / NA) * Math.PI * 2;
-    cosT[a] = Math.cos(th); sinT[a] = Math.sin(th);
-    for (let r = 0; r < NR; r++) {
-      const rr = ((r + 0.5) / NR) * half;
-      const x = Math.round(cx + rr * cosT[a]);
-      const y = Math.round(cy + rr * sinT[a]);
-      polar[a * NR + r] = (x >= 0 && x < cw && y >= 0 && y < chh) ? chipMask[y * cw + x] : 0;
-    }
-  }
-  // gapMask 也转极坐标（同一采样格）
-  const gapPolar = new Float32Array(NA * NR);
-  for (let a = 0; a < NA; a++) {
-    for (let r = 0; r < NR; r++) {
-      const rr = ((r + 0.5) / NR) * half;
-      const x = Math.round(cx + rr * cosT[a]);
-      const y = Math.round(cy + rr * sinT[a]);
-      gapPolar[a * NR + r] = (x >= 0 && x < cw && y >= 0 && y < chh) ? gapMask[y * cw + x] : 0;
-    }
-  }
+  // ---------- 3) 答案：把折线方向转到缺口方向 ----------
+  // 图像坐标 y 向下；CSS rotate 正方向是顺时针（与图像 y 向下坐标系一致）。
+  const angMark = Math.atan2(mvy, mvx);            // 折线当前方向（图像角）
+  const angGap = glen < 3 ? angMark                  // 缺口无明显偏移 ⇒ 不需要转
+                          : Math.atan2(gvy, gvx);  // 缺口标记方向
+  let deg = Math.round((angGap - angMark) * 180 / Math.PI);
+  deg = ((deg % 360) + 360) % 360;                  // 归一到 [0,360)
 
-  let bestAng = 0, bestIou = -1, secondIou = -1;
-  for (let deg = 0; deg <= vmax; deg++) {
-    const shift = Math.round((deg / 360) * NA) % NA;
-    let inter = 0, uni = 0;
-    for (let k = 0; k < NA * NR; k++) {
-      const a = gapPolar[k];
-      const c = polar[((Math.floor(k / NR) + shift) % NA) * NR + (k % NR)];
-      if (a && c) inter++;
-      if (a || c) uni++;
-    }
-    const iou = uni ? inter / uni : 0;
-    if (iou > bestIou) { secondIou = bestIou; bestIou = iou; bestAng = deg; }
-    else if (iou > secondIou) secondIou = iou;
-  }
-  const margin = bestIou - Math.max(0, secondIou);
   return {
-    i: bestAng, value: bestAng, vmax,
-    iou: Math.round(bestIou * 1000) / 1000,
-    margin: Math.round(margin * 1000) / 1000,
-    gapBox: [ox, oy, ow, oh], otsu: bestT,
-    note: 'rotate: 极坐标 IoU（chip 掩码 vs 缺口 Otsu 掩码）',
+    i: deg, value: deg, vmax,
+    ball: { x: Math.round(ball.x), y: Math.round(ball.y), n: ball.n },
+    mark: { x: Math.round(mark.x), y: Math.round(mark.y), n: mark.n },
+    markVec: [Math.round(mvx), Math.round(mvy)],
+    markLen: Math.round(mlen), ballR: Math.round(ballR), minDist: Math.round(minDist),
+    gapCenter: { x: Math.round(gapC.x), y: Math.round(gapC.y), n: gN },
+    gapVec: [Math.round(gvx), Math.round(gvy)],
+    otsu: thr,
+    note: 'rotate: 红球中心 → 暗折线方向 对齐 缺口暗标记方向',
   };
 }
