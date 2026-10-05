@@ -39,6 +39,9 @@ jobs:
       # Telegram 通知（bot token + chat id 都放 Secret，不入库）
       TG_TOKEN: ${{ secrets.TG_TOKEN }}
       TG_CHAT: ${{ secrets.TG_CHAT }}
+      # ★ 手动 force 调试时静默失败通知（避免刷屏）。
+      #   cron 自动跑时不设 ⇒ 成功/失败都正常推送。
+      TG_DEBUG: ${{ github.event.inputs.force == '1' && '1' || '' }}
       # 距到期多少小时内才真的续（默认 48）
       OW_THRESHOLD_H: ${{ github.event.inputs.force == '1' && '9999' || '72' }}
       # 验证码失败预算有限，重试最多 2 次
