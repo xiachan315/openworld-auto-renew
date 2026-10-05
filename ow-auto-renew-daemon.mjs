@@ -159,13 +159,28 @@ function imageInfoScore(b64, maxSamples = 1200) {
   return { std: Math.round(std * 10) / 10, range: Math.round(max - min), n, w, h };
 }
 
-/** 背景图「太单调」⇒ 抓到了空白/半渲染（像素尺寸正常但内容空） */
+/**
+ * 背景图「太单调」⇒ 抓到了空白/半渲染（像素尺寸正常但内容空）。
+ *
+ * ★★ 阈值必须**以 range 为主、std 为辅**（2026-10-05 run#23 实测打脸）：
+ *   我原先用 `std < 12` 一刀切，结果把**低对比度的正常题目图**误杀：
+ *     2427B  std=8.3  range=173   ← 被判「空白图」，整轮直接 GRAB_EMPTY 终止
+ *     36972B（正常背景图）
+ *   `range=173` 说明像素值跨度极大（0~173），**明显有内容**，
+ *   只是整体偏暗/对比度低 ⇒ std 小是正常现象，不是空白。
+ *
+ * 真正的纯色空白图（实测造出来的）：std=0, range=0。
+ * 低对比度正常图（实测）：std=8.3, range=173。
+ * ⇒ **range 才是可靠判据**，std 只在 range 也很小时作为辅助。
+ */
 const grabTooFlat = (b64, kind) => {
   if (kind === 'chip') return false;           // chip 可能本身就很单调
   const info = imageInfoScore(b64);
   if (!info) return true;                       // 解不出信息 ⇒ 视为空
-  // 实测：真实题目图 std 明显大于 20；空白图接近 0
-  return info.std < 12 || info.range < 60;
+  // 实测数据点：纯色(0,0) / 低对比度正常图(8.3,173) / 正常题图(41.4,146)
+  // 判据：range < 25 ⇒ 真是空白；range 够大就放过（不管 std 多小）
+  if (info.range < 25) return true;
+  return false;
 };
 
 const ready = (page) => page.evaluate(() => {
@@ -1241,14 +1256,22 @@ const mode = process.argv[2] || 'once';
     //    这里不要再拼标题，否则会出现两条标题。
     if (process.env.TG_TOKEN && process.env.TG_CHAT) {
       const isForce = process.env.OW_THRESHOLD_H === '9999';
-      if (!r.skipped || isForce) {
-        try {
-          await notify('', formatResult(r), { raw: true });
-        } catch (e) {
-          console.warn('Telegram 通知异常（不影响结果）:', e.message);
-        }
+      // ★ 调试期静默（2026-10-05）：我连续手动 force 跑了 8 次，
+      //   每次都推一条失败通知，把用户刷了 8 条 —— 而 cron 一次都没跑过。
+      //   ⇒ TG_DEBUG=1 时只有「成功」才推，失败只在 Actions 日志里。
+      const debugMode = process.env.TG_DEBUG === '1';
+      if (debugMode && !r.ok) {
+        console.log('[TG] 调试模式：失败不推送（cron 正常运行会正常推送）');
       } else {
-        console.log('[TG] 跳过通知（未到续期窗口，避免刷屏）');
+        if (!r.skipped || isForce) {
+          try {
+            await notify('', formatResult(r), { raw: true });
+          } catch (e) {
+            console.warn('Telegram 通知异常（不影响结果）:', e.message);
+          }
+        } else {
+          console.log('[TG] 跳过通知（未到续期窗口，避免刷屏）');
+        }
       }
     }
     // GitHub Actions：把结论写进 $GITHUB_STEP_SUMMARY，便于在网页上直接看
