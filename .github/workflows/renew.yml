@@ -43,6 +43,10 @@ jobs:
       OW_THRESHOLD_H: ${{ github.event.inputs.force == '1' && '9999' || '72' }}
       # 验证码失败预算有限，重试最多 2 次
       OW_MAX_TRY: '2'
+      # 每个 cron 跑几次「重开浏览器会话」：换题在同一会话里会失效
+      # （实测 40 阶段题型不变），只有新会话能重新摇。
+      # 平台有 24h 冷却 ⇒ 同一 cron 内多次尝试的边际收益递减，4 次够。
+      OW_SESSIONS: '4'
 
     steps:
       - uses: actions/checkout@v4
