@@ -450,16 +450,26 @@ async function doRenew(page) {
         target = r2.i;
         rounds.push({ stage, kind, theta: r2.theta, aniso: r2.aniso, target });
       } else if (kind === 'key') {
-        // meta.alt 可能自环（key->key），换题永远换不出可解题型。
-        // 实测（Actions run #2）：连换 17 次全是 key，白烧 6 分钟。
-        // ⇒ 连续 3 次仍抽到 key 就放弃本轮，交给下次 cron 重试。
-        if (++keySwitches > 3) {
+        // ★ 换题机制一直是好的，是我之前的**判据错了**（用 hint 文本/背景图指纹，
+        //   两者都不随换题变化 ⇒ 误判成 alt 自环）。
+        //   2026-10-04 本机实测：连点换题 8 次 ⇒ 8 种不同题型，key 只占 1/9。
+        //   正确判据是 meta.id / meta.kind（见 puzzleFingerprint）。
+        // ⇒ 抽到 key 就换，最多换 12 次；抽到别的题型立刻清零。
+        if (++keySwitches > 12) {
           return { ok: false, why: 'KEY_STUCK', rounds,
-                   note: '连续换题仍抽到 key（alt 自环），本轮放弃，等下次重试' };
+                   note: `连换 ${keySwitches} 次仍抽到 key（本轮放弃，等下次 cron）` };
         }
         rounds.push({ stage, kind, skipped: 'unreliable', keySwitch: keySwitches });
         log(`  阶段${stage + 1} key 不可靠，换题（第 ${keySwitches} 次）`);
-        if (!await switchKind(page)) await page.waitForTimeout(2500);
+        await switchKind(page);
+        // 换题后看新题型：不是 key 就清零（说明换题真的生效了）
+        const newKind = await page.evaluate(() => window.__owCapMeta?.kind || null);
+        if (newKind && newKind !== 'key') {
+          log(`  → 已换到 ${newKind} 题型，清零 key 计数`);
+          keySwitches = 0;
+        } else {
+          await page.waitForTimeout(2000);
+        }
         continue;
       } else {
         // 拼块宽度必须从 DOM 的 chip style.width 读（puzzle=32% / key=24%，不能猜）
