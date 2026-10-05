@@ -751,61 +751,146 @@ export function solveKey(bgImg, chipImg, meta) {
 }
 
 /**
- * rotate 题正解：用**主轴方向**判定箭头朝向，算出需要的 CSS 旋转角。
+ * rotate 题：把 chip 旋转到与背景缺口对齐。
  *
- * 协议（实测 + 读源码）：
- *   · value = CSS rotate 角度（度），vmax=359
- *   · chip 的 PNG 里图形**已经是被随机旋转过的**（实测抓到一支歪着的箭头）
- *   · transform = rotate(value deg) ⇒ 要抵消 PNG 里的初始旋转
- *   · "正立" = 箭头朝上 ⇒ 答案 = -当前朝向角（模 360）
+ * ★★ 2026-10-05 重写。旧版用「二阶矩主轴角」判定，**对圆形 chip 完全无效**：
+ *   实测 chip 是「红色圆 + 左侧黑色折线」（截图确认），主体圆形 ⇒ 各向异性 aniso≈0
+ *   ⇒ 主轴角 theta 由像素噪声决定 ⇒ **每张图都返回同一个 90**
+ *   （日志实测 `rotate value=90 chip→90` 恒定）。
  *
- * 判定方法（二值掩码的**二阶矩**）：
- *   长轴方向 θ = 0.5·atan2(2μ11, μ20-μ02)
- *   箭头有明确的单一主轴 ⇒ θ 就是图形朝向。
- *   箭头朝右时 θ≈0°（图像坐标，y 向下），朝上时 θ≈-90°。
- *   ⇒ 需要的旋转 = -90° - θ，归一到 [0,360)
+ * 正确信息源（全部来自 meta，零猜测）：
+ *   ow/oh = 缺口框尺寸（实测 72x72）
+ *   ox/oy = 缺口框中心
+ *   vmax  = 359（角度范围，value 即 CSS rotate 的度数）
+ *
+ * 判据：缺口区域（bg 的 ox/oy/ow/oh 框）与 chip 的**形状轮廓**做相关匹配，
+ *   取 0..359 中使轮廓重合度最高的角。
+ *   实现：极坐标采样 —— 把 chip 掩码与 bg 缺口区都转成 72x72，
+ *   对每个候选角度旋转 chip（最近邻），算 IoU，取最大。
+ *   72x72 × 360 个角度在纯 JS 下约 190 万次采样，可接受（<1s）。
+ *
+ * @param chipImg  chip 帧（RGBA）
+ * @param bgImg   背景帧（RGBA）—— 缺路口在它里面
+ * @param meta    { ow, oh, ox, oy, vmax }
  */
-export function solveRotate2(chipImg, meta) {
-  const { w, h, data } = chipImg;
-  // alpha 掩码
-  const pts = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const i = (y * w + x) * 4;
-      if (data[i + 3] > 128) pts.push([x, y]);
+export function solveRotate2(chipImg, bgImg, meta = {}) {
+  const chip = chipImg;
+  const bg = bgImg;
+  if (!chip || !chip.data) return { i: null, why: 'NO_CHIP_IMG' };
+  if (!bg || !bg.data) return { i: null, why: 'NO_BG_IMG' };
+
+  const vmax = meta.vmax || 359;
+  const ow = Math.round(meta.ow || 72), oh = Math.round(meta.oh || 72);
+  const ox = Math.round(meta.ox || 0), oy = Math.round(meta.oy || 0);
+
+  // ---- 1) chip 掩码（alpha > 128），缩放到 ow x oh ----
+  const cw = ow, chh = oh;
+  const chipMask = new Uint8Array(cw * chh);
+  const sx = chip.w / cw, sy = chip.h / chh;
+  for (let y = 0; y < chh; y++) {
+    for (let x = 0; x < cw; x++) {
+      const gx = Math.min(chip.w - 1, Math.floor(x * sx));
+      const gy = Math.min(chip.h - 1, Math.floor(y * sy));
+      chipMask[y * cw + x] = chip.data[(gy * chip.w + gx) * 4 + 3] > 128 ? 1 : 0;
     }
   }
-  if (pts.length < 50) return { i: null, why: 'CHIP_EMPTY' };
-  const n = pts.length;
-  const mx = pts.reduce((s, p) => s + p[0], 0) / n;
-  const my = pts.reduce((s, p) => s + p[1], 0) / n;
-  let m20 = 0, m02 = 0, m11 = 0;
-  for (const [x, y] of pts) {
-    const dx = x - mx, dy = y - my;
-    m20 += dx * dx; m02 += dy * dy; m11 += dx * dy;
-  }
-  m20 /= n; m02 /= n; m11 /= n;
-  // 主轴角（图像坐标系，y 向下；0° = 水平向右，90° = 垂直向下）
-  const theta = 0.5 * Math.atan2(2 * m11, m20 - m02) * 180 / Math.PI;
-  // 各向异性：接近 1 说明是细长形（箭头），接近 0 说明是圆
-  const tmp = Math.sqrt((m20 - m02) ** 2 + 4 * m11 * m11);
-  const lambda1 = (m20 + m02 + tmp) / 2;
-  const lambda2 = (m20 + m02 - tmp) / 2;
-  const aniso = lambda1 > 1e-6 ? (lambda1 - lambda2) / lambda1 : 0;
 
-  // 「正立」= 主轴垂直（朝上或朝下）。箭头有头尾之分，靠图形本身判断朝上还是朝下：
-  // 简化：取主轴方向中"更陡"的那个朝向为目标 —— 即让长轴变成垂直。
-  // 需要的 CSS 旋转（图像 y 向下 ⇒ CSS rotate 正方向是顺时针，与数学相反，这里用经验式）
-  let need = 0;
-  // 长轴当前角 theta；希望长轴垂直 ⇒ 目标角 ±90°；取最小旋转量
-  const cands = [90 - theta, -90 - theta];
-  for (const c of cands) {
-    const v = ((Math.round(c) % 360) + 360) % 360;
-    if (need === 0 || v < need) need = v;
+  // ---- 2) 缺口掩码：从 bg 的 (ox,oy,ow,oh) 框里取「非背景」像素 ----
+  // bg 与 chip 同坐标系（逻辑 300x160）；按比例映射到像素
+  const bw = bg.w, bh = bg.h;
+  const metaW = 300, metaH = 160;
+  const bsx = bw / metaW, bsy = bh / metaH;
+  const x0 = Math.max(0, Math.floor(ox * bsx)), x1 = Math.min(bw, Math.ceil((ox + ow) * bsx));
+  const y0 = Math.max(0, Math.floor(oy * bsy)), y1 = Math.min(bh, Math.ceil((oy + oh) * bsy));
+  if (x1 - x0 < 8 || y1 - y0 < 8) return { i: null, why: 'GAP_BOX_TOO_SMALL' };
+
+  // 缺口 = 框内「与框边缘明显不同」的像素。用 Otsu 阈值分离。
+  const boxW = x1 - x0, boxH = y1 - y0;
+  const lum = new Float32Array(boxW * boxH);
+  let lmin = 1e9, lmax = -1e9;
+  for (let y = 0; y < boxH; y++) {
+    for (let x = 0; x < boxW; x++) {
+      const i = ((y0 + y) * bw + (x0 + x)) * 4;
+      const l = bg.data[i] * 0.299 + bg.data[i + 1] * 0.587 + bg.data[i + 2] * 0.114;
+      lum[y * boxW + x] = l;
+      if (l < lmin) lmin = l;
+      if (l > lmax) lmax = l;
+    }
   }
+  // Otsu
+  const hist = new Float64Array(256);
+  for (let k = 0; k < lum.length; k++) hist[Math.max(0, Math.min(255, Math.round(lum[k])))]++;
+  const total = lum.length;
+  let sumAll = 0;
+  for (let t = 0; t < 256; t++) sumAll += t * hist[t];
+  let sumB = 0, wB = 0, best = 0, bestT = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += hist[t]; if (!wB) continue;
+    const wF = total - wB; if (!wF) break;
+    sumB += t * hist[t];
+    const mB = sumB / wB, mF = (sumAll - sumB) / wF;
+    const between = wB * wF * (mB - mF) * (mB - mF);
+    if (between > best) { best = between; bestT = t; }
+  }
+  // 缺口掩码：缩放到 cw x chh
+  const gapMask = new Uint8Array(cw * chh);
+  const gsx = boxW / cw, gsy = boxH / chh;
+  for (let y = 0; y < chh; y++) {
+    for (let x = 0; x < cw; x++) {
+      const gx = Math.min(boxW - 1, Math.floor(x * gsx));
+      const gy = Math.min(boxH - 1, Math.floor(y * gsy));
+      gapMask[y * cw + x] = lum[gy * boxW + gx] < bestT ? 1 : 0;
+    }
+  }
+
+  // ---- 3) 极坐标 IoU：chip 掩码绕中心旋转 0..vmax 度，与 gapMask 比 ----
+  const cx = (cw - 1) / 2, cy = (chh - 1) / 2;
+  const half = Math.min(cw, chh) / 2;
+  // 预采样 chip 掩码的极坐标（角度 × 半径）
+  const NA = 180, NR = 36;                    // 180 方向 × 36 半径
+  const polar = new Float32Array(NA * NR);
+  const cosT = new Float32Array(NA), sinT = new Float32Array(NA);
+  for (let a = 0; a < NA; a++) {
+    const th = (a / NA) * Math.PI * 2;
+    cosT[a] = Math.cos(th); sinT[a] = Math.sin(th);
+    for (let r = 0; r < NR; r++) {
+      const rr = ((r + 0.5) / NR) * half;
+      const x = Math.round(cx + rr * cosT[a]);
+      const y = Math.round(cy + rr * sinT[a]);
+      polar[a * NR + r] = (x >= 0 && x < cw && y >= 0 && y < chh) ? chipMask[y * cw + x] : 0;
+    }
+  }
+  // gapMask 也转极坐标（同一采样格）
+  const gapPolar = new Float32Array(NA * NR);
+  for (let a = 0; a < NA; a++) {
+    for (let r = 0; r < NR; r++) {
+      const rr = ((r + 0.5) / NR) * half;
+      const x = Math.round(cx + rr * cosT[a]);
+      const y = Math.round(cy + rr * sinT[a]);
+      gapPolar[a * NR + r] = (x >= 0 && x < cw && y >= 0 && y < chh) ? gapMask[y * cw + x] : 0;
+    }
+  }
+
+  let bestAng = 0, bestIou = -1, secondIou = -1;
+  for (let deg = 0; deg <= vmax; deg++) {
+    const shift = Math.round((deg / 360) * NA) % NA;
+    let inter = 0, uni = 0;
+    for (let k = 0; k < NA * NR; k++) {
+      const a = gapPolar[k];
+      const c = polar[((Math.floor(k / NR) + shift) % NA) * NR + (k % NR)];
+      if (a && c) inter++;
+      if (a || c) uni++;
+    }
+    const iou = uni ? inter / uni : 0;
+    if (iou > bestIou) { secondIou = bestIou; bestIou = iou; bestAng = deg; }
+    else if (iou > secondIou) secondIou = iou;
+  }
+  const margin = bestIou - Math.max(0, secondIou);
   return {
-    i: need, value: need, vmax: meta.vmax || 359,
-    theta: Math.round(theta * 10) / 10, aniso: Math.round(aniso * 1000) / 1000,
-    n, note: 'rotate: 主轴方向',
+    i: bestAng, value: bestAng, vmax,
+    iou: Math.round(bestIou * 1000) / 1000,
+    margin: Math.round(margin * 1000) / 1000,
+    gapBox: [ox, oy, ow, oh], otsu: bestT,
+    note: 'rotate: 极坐标 IoU（chip 掩码 vs 缺口 Otsu 掩码）',
   };
 }

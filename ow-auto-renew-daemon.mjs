@@ -142,65 +142,97 @@ async function moveHuman(page, x, y) {
 
 /** 取 chip（拼块）自己的 PNG —— rotate 题判定朝向要用 */
 async function grabChipPng(page) {
-  // 优先：chip 是 <img> 且 src 是 blob（key/puzzle 题型）
-  const fromImg = await page.evaluate(async () => {
-    const chip = document.getElementById('captcha_chip_default');
-    if (!chip) return null;
-    if (chip.tagName === 'IMG' && chip.src && chip.src.startsWith('blob:')) {
-      const buf = await (await (await fetch(chip.src)).blob()).arrayBuffer();
-      const u8 = new Uint8Array(buf);
-      let s = '';
-      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
-      return s;
-    }
-    return null;
-  });
-  if (fromImg) return fromImg;
+  // ★★★ 2026-10-05 实测修掉的两个真 bug（rotate 题型连续 20 次 not a PNG）：
+  //
+  // bug 1：原「优先」路径把**原始二进制字符串**直接返回（`s`），
+  //        但调用方 `decodePngFromB64(chipPng)` 需要的是 **base64**
+  //        ⇒ 第一道就抛 "not a PNG"，**永远走不到截图兜底**。
+  //        修法：改成 `btoa(s)`。
+  // bug 2：`page.evaluate` 回传有上限（实测截断在 ~4KB 字符），
+  //        chip 若超过该大小，btoa 后也会被截断 ⇒ 仍是非法 PNG。
+  //        ⇒ **截图优先**（Buffer 直接在 Node 侧，不经 evaluate，无上限），
+  //          evaluate 只作兜底（小图才可靠）。
+  //
+  // 实测 chip 本身完全正常：<img id=captcha_chip_default src=blob:...>，
+  // naturalWidth/Height=72，blob 5090 字节，签名 iVBORw0KGgo。
+  const sel = '#captcha_chip_default';
 
-  // 兜底（rotate 题型实测 chip 不是 img，src 取到非 PNG）：
-  // 直接对 chip 的屏幕区域截图 —— 对任何题型都成立。
-  const box = await page.evaluate(() => {
-    const c = document.getElementById('captcha_chip_default');
+  // ---- 路径 1：元素截图（无回传上限，首选）----
+  try {
+    const png = await page.locator(sel).first().screenshot({ type: 'png' });
+    if (png && png.length > 200) return png.toString('base64');
+  } catch (e) { /* 落到 clip / evaluate */ }
+
+  // ---- 路径 2：视口内 clip 截图 ----
+  const box = await page.evaluate((s) => {
+    const c = document.querySelector(s);
     if (!c) return null;
     const r = c.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) return null;
-    // ★ 必须确认 chip 完全落在视口内，否则 page.screenshot({clip}) 会截到
-    //   视口外的空白 ⇒ 拿到非 PNG 数据（实测 rotate 题型 20 次全部 not a PNG）。
-    const vw = window.innerWidth, vh = window.innerHeight;
-    if (r.x < 0 || r.y < 0 || r.right > vw || r.bottom > vh) return null;
+    // 必须完全在视口内，否则 clip 截到空白
+    if (r.x < 0 || r.y < 0 || r.right > innerWidth || r.bottom > innerHeight) return null;
     return { x: r.x, y: r.y, width: r.width, height: r.height };
-  });
-  if (!box) return null;
-  // 优先用元素截图（Playwright 会自动滚动到元素）
-  try {
-    const png = await page.locator('#captcha_chip_default').first().screenshot({ type: 'png' });
-    const b64 = png.toString('base64');
-    if (b64 && b64.length > 200) return b64;
-  } catch (e) { /* 退到 clip */ }
-  try {
-    const png = await page.screenshot({
-      clip: { x: box.x, y: box.y, width: box.width, height: box.height },
-      type: 'png',
-    });
-    return png.toString('base64');
-  } catch (e) {
-    return null;
+  }, sel);
+  if (box) {
+    try {
+      const png = await page.screenshot({
+        clip: { x: box.x, y: box.y, width: box.width, height: box.height }, type: 'png',
+      });
+      if (png && png.length > 200) return png.toString('base64');
+    } catch (e) { /* 落到 evaluate */ }
   }
+
+  // ---- 路径 3：页面内 fetch blob（★ 必须 btoa）----
+  const b64 = await page.evaluate(async (s) => {
+    const chip = document.querySelector(s);
+    if (!chip || chip.tagName !== 'IMG' || !chip.src || !chip.src.startsWith('blob:')) return null;
+    try {
+      const buf = await (await (await fetch(chip.src)).blob()).arrayBuffer();
+      const u8 = new Uint8Array(buf);
+      let bin = '';
+      // 分块 concat，避免 apply 参数上限
+      const CH = 4096;
+      for (let i = 0; i < u8.length; i += CH) {
+        bin += String.fromCharCode.apply(null, u8.subarray(i, i + CH));
+      }
+      return btoa(bin);
+    } catch (e) { return null; }
+  }, sel);
+  if (b64 && b64.length > 200) return b64;
+
+  return null;
 }
 
 /** 取页面**当前这道题**的 PNG（另开 ws 拿到的是另一题，必错） */
 async function grabPng(page) {
-  return page.evaluate(async () => {
-    const bg = document.getElementById('captcha_bg_default');
+  // ★ 与 grabChipPng 同一个坑：`page.evaluate` 的返回值有硬上限（实测 ~4KB 字符）。
+  //   背景 PNG 实测 17152 字节 ⇒ base64 后 22869 字符 ⇒ **必然被截断**
+  //   ⇒ 表现是「图片明明有 src，却解析失败 / 结果恒定」。
+  //   修法：**元素截图优先**（Buffer 直接在 Node 侧，绕过回传上限）。
+  const sel = '#captcha_bg_default';
+
+  // ---- 路径 1：元素截图 ----
+  try {
+    const png = await page.locator(sel).first().screenshot({ type: 'png' });
+    if (png && png.length > 200) return { b64: png.toString('base64'), via: 'shot' };
+  } catch (e) { /* 落到 evaluate */ }
+
+  // ---- 路径 2：页面内 fetch blob（小图才可靠）----
+  const r = await page.evaluate(async (s) => {
+    const bg = document.querySelector(s);
     if (!bg || !bg.src || !bg.src.startsWith('blob:')) return { err: 'no blob' };
-    const buf = await (await (await fetch(bg.src)).blob()).arrayBuffer();
-    const u8 = new Uint8Array(buf);
-    let s = '';
-    for (let i = 0; i < u8.length; i += 8192) {
-      s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
-    }
-    return { b64: btoa(s) };
-  });
+    try {
+      const buf = await (await (await fetch(bg.src)).blob()).arrayBuffer();
+      const u8 = new Uint8Array(buf);
+      let bin = '';
+      for (let i = 0; i < u8.length; i += 4096) {
+        bin += String.fromCharCode.apply(null, u8.subarray(i, i + 4096));
+      }
+      return { b64: btoa(bin), bytes: u8.length };
+    } catch (e) { return { err: 'fetch: ' + String(e.message).slice(0, 40) }; }
+  }, sel);
+  if (r && r.b64) return { b64: r.b64, via: 'eval', bytes: r.bytes };
+  return { err: (r && r.err) || 'grab-failed' };
 }
 
 // odd 题固定网格（实测 5/5 样本一致）
@@ -310,28 +342,75 @@ async function puzzleFingerprint(page) {
  * ⇒ 改用**题面图像指纹**（blob src 的 FNV-1a 哈希 + 长度）作为判据。
  *   顺带也接受 stage 推进（token 出现）作为成功信号。
  */
+/**
+ * 点「Try another way」换题，并确认**题面真的换了**。
+ *
+ * ★★ 2026-10-05 Actions run#19 实测：**坐标点击在 Linux headless 上 100% 失效**
+ *   （40 阶段全是同一题型，`→ 已换到` 计数 = 0），
+ *   而本机 Windows headless 实测 6 次点击 6 个不同 id 完全正常。
+ *   ⇒ 不能只靠 `page.mouse.click(x, y)`：headless Chromium 的元素坐标
+ *     与 hover 触发的可见性都可能与本机不同。
+ *
+ * 解法（按可靠性排序，逐级回退）：
+ *   ① DOM 直接 click（`el.click()`，触发组件自己的事件处理，不依赖坐标/可见性）
+ *   ② Playwright 的 `locator.click()`（自带滚动 + 可见性检查）
+ *   ③ 坐标点击（兜底，本机实测有效）
+ * 每一级都单独验证 meta.id 是否变化，全失败才算换题失败。
+ */
 async function switchKind(page) {
-  const sw = page.locator('#captcha_switch_default').first();
-  const bb = await sw.boundingBox();
-  if (!bb) return false;
   const beforeFp = await puzzleFingerprint(page);
   const beforeStage = (await readState(page)).stage;
   const beforeSrc = await page.evaluate(() => document.getElementById('captcha_bg_default')?.src || null);
-  const cx = bb.x + bb.width / 2, cy = bb.y + bb.height / 2;
-  await moveHuman(page, cx, cy);
-  await page.mouse.click(cx, cy);
-  // 服务端可能限流 / 冷却 ⇒ 轮询等新题就绪
-  for (let i = 0; i < 10; i++) {
-    await page.waitForTimeout(400);
+
+  // ---- 尝试 1：DOM click ----
+  await page.evaluate(() => {
+    const el = document.getElementById('captcha_switch_default');
+    if (el) el.click();
+  });
+  if (await waitFpChange(page, beforeFp, beforeStage, beforeSrc)) return true;
+
+  // ---- 尝试 2：Playwright locator.click（自动滚动到元素）----
+  try {
+    const loc = page.locator('#captcha_switch_default').first();
+    if (await loc.count()) {
+      await loc.click({ timeout: 4000, force: true });
+    }
+  } catch (e) { /* 落到坐标点击 */ }
+  if (await waitFpChange(page, beforeFp, beforeStage, beforeSrc)) return true;
+
+  // ---- 尝试 3：坐标点击（本机实测有效的那条）----
+  const bb = await page.locator('#captcha_switch_default').first().boundingBox().catch(() => null);
+  if (bb) {
+    const cx = bb.x + bb.width / 2, cy = bb.y + bb.height / 2;
+    await moveHuman(page, cx, cy);
+    await page.mouse.click(cx, cy);
+    if (await waitFpChange(page, beforeFp, beforeStage, beforeSrc)) return true;
+  }
+
+  const st = await readState(page);
+  // ★ 实测（2026-10-05）：换题**不是点击方式的问题**，而是服务端给每个会话
+  //   有限的重摇预算（本机实测 5 次后永久失效，之后点击毫无反应）。
+  //   ⇒ 换题无效 = 预算耗尽，正确反应是**重开会话**，不是继续换。
+  log(`  ⚠️ 换题预算耗尽（3 种点击方式均无新题）stage=${st.stage} id=${
+    (beforeFp || 'null').split(':')[1] || 'null'} —— 需重开会话重摇`);
+  return false;
+}
+
+/** 等题面指纹变化；变了返回 true。最多约 6 秒。 */
+async function waitFpChange(page, beforeFp, beforeStage, beforeSrc) {
+  // 18 × 500ms ≈ 9s。实测服务端下发新 meta 有 2~3s 延迟，6s 太紧会漏判。
+  for (let i = 0; i < 18; i++) {
+    await page.waitForTimeout(500);
     const stNow = await readState(page);
     if (stNow.tokenLen > 0) return true;               // 答案已过 = 成功
-    if (stNow.stage !== beforeStage) return true;     // 阶段推进 = 成功
+    // ⚠️ 不要再把「stage 变化」当换题成功：答错后服务端会重发同 stage 的新题，
+    //   实测 stage 会在 1/6 ↔ 2/6 之间反复倒退（换题前后同一个 stage 也可能变），
+    //   用它做判据会把「没换题」误判成「换题成功」，然后原地空转。
+    //   唯一可靠判据 = meta.id 变化（见 puzzleFingerprint）。
     if (await waitReady(page, 2, 300)) {
       const afterFp = await puzzleFingerprint(page);
       const afterSrc = await page.evaluate(() => document.getElementById('captcha_bg_default')?.src || null);
-      // 指纹变了才叫换题成功；指纹为 null（还没图）时退回等就绪
-      if (afterFp && beforeFp && afterFp !== beforeFp) return true;
-      // meta 未捕获时（钩子没装上）的兜底：比对背景 blob src 的 href 字符串
+      if (beforeFp && afterFp && afterFp !== beforeFp) return true;
       if ((!beforeFp || !afterFp) && beforeSrc && afterSrc && beforeSrc !== afterSrc) return true;
     }
   }
@@ -342,7 +421,17 @@ async function doRenew(page) {
   // 1) 开弹窗
   await page.locator('button').filter({ hasText: /^Renew free$/ }).first().click({ timeout: 15000 });
   await page.waitForTimeout(1500);
-  if (!await waitReady(page)) return { ok: false, why: 'STAGE_NOT_READY' };
+  // ⚠️ 实测：新会话首次点 Renew 后题面偶尔要 10s+ 才就绪。
+  //   waitReady 失败时重开一次弹窗，仍失败才算 NOT_READY。
+  if (!await waitReady(page)) {
+    log('  ⚠️ 弹窗未就绪，重开一次');
+    await page.waitForTimeout(3000);
+    try {
+      await page.locator('button').filter({ hasText: /^Renew free$/ }).first()
+        .click({ timeout: 8000 });
+    } catch (e) { /* 弹窗可能已开着 */ }
+    if (!await waitReady(page)) return { ok: false, why: 'STAGE_NOT_READY' };
+  }
 
   // 2) 若首阶段是 rotate / key（暂不能稳定离线求解的题型），先换题
   for (let i = 0; i < 8; i++) {
@@ -350,12 +439,19 @@ async function doRenew(page) {
     const k = kindOf(st.hint);
     if (k !== 'rotate' && k !== 'key') break;
     if (!st.canSwitch) break;
-    if (!await switchKind(page)) { await page.waitForTimeout(1800); }
+    // ★ 换题无效就别在这空转 —— 直接进入求解阶段，让多会话去重摇题型。
+    if (!await switchKind(page)) {
+      log(`  ⚠️ 开局换题无效（题型仍是 ${k}），直接进求解阶段`);
+      break;
+    }
   }
   // 3) 逐阶段求解（按题型分派）
   const rounds = [];
   let st = await readState(page);
   let keySwitches = 0;
+  let switchFails = 0;
+  let grabVia = null;
+  let grabBytes = 0;
   let lastMatch = null;
   let lastOdd = null;
   let lastPuzzle = null;
@@ -374,8 +470,26 @@ async function doRenew(page) {
     if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds };
 
     const kind = kindOf(st.hint);
-    const png = await grabPng(page);
-    if (png.err) return { ok: false, why: 'GRAB_FAIL', rounds };
+    // ★ no-blob 是**时序**问题不是算法问题（实测 39 次）：
+    //   waitReady 通过后、grabPng 执行前，服务端可能正在重发新题（答错后必发），
+    //   旧 blob 被 revoke、新 blob 还没挂上 ⇒ src 变空。
+    //   ⇒ 抓不到时**重等就绪再抓**，最多 4 次；仍失败才放弃。
+    let png = await grabPng(page);
+    let grabRetry = 0;
+    while (png.err && grabRetry < 4) {
+      grabRetry++;
+      log(`  阶段${stage + 1} 抓图失败(${png.err})，第 ${grabRetry} 次重等就绪`);
+      await page.waitForTimeout(1200);
+      if (!await waitReady(page)) {
+        return { ok: false, why: 'NOT_READY', rounds };
+      }
+      png = await grabPng(page);
+    }
+    if (png.err) return { ok: false, why: 'GRAB_FAIL:' + png.err, rounds, grabRetry };
+    // 记录抓取路径：'shot' = 元素截图（不受 ~4KB 回传上限影响，可信）
+    //                'eval' = 页面内 fetch blob（超过上限会被静默截断）
+    grabVia = png.via || '?';
+    grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
     const img = await decodePng(page, png.b64);
 
     if (kind === 'odd') {
@@ -395,7 +509,12 @@ async function doRenew(page) {
         // 真正的止损点是「整轮 24 个阶段用尽」，那时自然返回失败。
         rounds.push({ stage, kind, i: sol.i, margin: sol.margin, note: '答案重复，换题' });
         log(`  阶段${stage + 1} odd 判定重复，换题`);
-        await switchKind(page);
+        if (!await switchKind(page)) {
+          if (++switchFails > 1) {
+            return { ok: false, why: 'SWITCH_DEAD', rounds,
+                     note: '换题按钮连续无效，重开会话重摇题型' };
+          }
+        } else switchFails = 0;
         continue;
       }
       lastOdd = { i: sol.i, margin: sol.margin };
@@ -428,6 +547,9 @@ async function doRenew(page) {
           valuenow: Number(chip.getAttribute('aria-valuenow') || 0),
           // chip 宽度是百分比字符串（如 "32%"）⇒ 供 solveGap 算拼块宽度
           chipWPct: parseFloat(chip.style.width) || 32,
+          // rotate 题的缺口框（来自服务端 meta：ow/oh/ox/oy）
+          // ⚠️ 必须从 __owCapMeta 读，不能猜 —— 实测 ow=oh=72, ox/oy 每次都变
+          cm: window.__owCapMeta || null,
         };
       });
       if (!meta) return { ok: false, why: 'NO_CHIP', rounds };
@@ -442,7 +564,11 @@ async function doRenew(page) {
         if (chipPng) {
           try {
             const chipImg = decodePngFromB64(chipPng);
-            r2 = solveRotate2(chipImg, { vmax: meta.vmax });
+            const cm = meta.cm || {};
+            r2 = solveRotate2(chipImg, img, {
+              vmax: cm.vmax || meta.vmax, ow: cm.ow, oh: cm.oh,
+              ox: cm.ox, oy: cm.oy,
+            });
           } catch (e) {
             // chip 的 blob 可能还没换成新题（src 仍是旧图或空）⇒ 换题重来
             r2 = { i: null, why: 'chip-decode:' + String(e.message).slice(0, 40) };
@@ -451,7 +577,13 @@ async function doRenew(page) {
         if (r2.i === null) {
           rounds.push({ stage, kind, skipped: r2.why });
           log(`  阶段${stage + 1} rotate ${r2.why}，换题`);
-          if (!await switchKind(page)) await page.waitForTimeout(2000);
+          if (!await switchKind(page)) {
+            if (++switchFails > 1) {
+              return { ok: false, why: 'SWITCH_DEAD', rounds,
+                       note: '换题按钮连续无效，重开会话重摇题型' };
+            }
+            await page.waitForTimeout(1500);
+          } else switchFails = 0;
           continue;
         }
         target = r2.i;
@@ -491,18 +623,56 @@ async function doRenew(page) {
         const sol = solveGap(img, { w: 300, h: 160, vmax: meta.vmax, pw, ph: pw,
                                     px: cm?.px, py: cm?.py });
         if (sol.i === null) {
-          const sw = page.locator('#captcha_switch_default').first();
-          const bb = await sw.boundingBox();
-          if (bb) { await page.mouse.click(bb.x + bb.width / 2, bb.y + bb.height / 2); await page.waitForTimeout(1200); }
-          rounds.push({ stage, kind, skipped: 'no-blob' });
-          log(`  阶段${stage + 1} ${kind} 缺口未定位，换题`);
+          // ★ 这里原来自己实现了一套坐标点击，绕过了 switchKind 的
+          //   三级回退（DOM click / locator.click / 坐标）与失败计数，
+          //   结果「缺口未定位」时空转 40 阶段（实测 119 次 puzzle 全耗在这）。
+          //   ⇒ 统一走 switchKind，止损交给 switchFails。
+          rounds.push({ stage, kind, skipped: 'no-gap-located', grabVia, grabBytes });
+          log(`  阶段${stage + 1} ${kind} 缺口未定位（via=${grabVia}, ${grabBytes}B），换题`);
+          const swOk = await switchKind(page);
+          if (swOk) switchFails = 0;
+          else if (++switchFails > 1) {
+            return { ok: false, why: 'SWITCH_DEAD', rounds,
+                     note: '换题预算耗尽，重开会话重摇题型' };
+          }
           continue;
         }
         target = sol.i;
       }
 
+      // 当前 value 读数（aria-valuenow）
+      const readVal = () => page.evaluate(() =>
+        Number(document.getElementById('captcha_chip_default')?.getAttribute('aria-valuenow') || 0));
+
+      // ---- 滑轨精调（键盘未命中时兜底）。定义在分支外，键盘/拖拽两条路径共用 ----
+      const vmax = meta.vmax || 204;
+      const handleW = meta.handleW || 24;
+      const span = Math.max(1, (meta.trackW || 0) - handleW);
+      // 协议 trackToValue：
+      //   frac = clamp((clientX - trackLeft - handleW/2) / (trackW - handleW), 0, 1)
+      //   value = round(frac * vmax)
+      const trackTo = async (want) => {
+        const f = Math.max(0, Math.min(1, want / vmax));
+        const x = meta.trackX + handleW / 2 + f * span;
+        await moveHuman(page, x, meta.trackCy);
+        await page.mouse.down();
+        await page.waitForTimeout(80);
+        await page.mouse.up();
+        await page.waitForTimeout(450);
+      };
+      const trackNudge = async (want) => {
+        // 精确逼近：每次按误差收缩，最多 10 次
+        let v = await readVal();
+        for (let i = 0; i < 10 && Math.abs(v - want) > 1; i++) {
+          await trackTo(want);
+          const nv = await readVal();
+          if (nv === v) break;          // 滑轨不动了（多半是 handleW/trackW 读错）
+          v = nv;
+        }
+        return v;
+      };
+
       // ---- 交互策略：先粗拖（产生真实 pointer 轨迹喂行为门），再键盘精调，最后 Enter 提交 ----
-      // ---- 交互策略 ----
       // 协议关键（读前端源码确认）：
       //   · chip 的 pointerdown/move 只改 value；**pointerup 才 submitSolution**
       //   · 键盘 ArrowLeft/Right 调 value（步进 2；Shift = vmax/18 粗调），Enter 提交
@@ -544,8 +714,6 @@ async function doRenew(page) {
       await page.waitForTimeout(1200);
 
       // 2) 键盘精确逼近。先验证一次按键是否真的改变 value（防焦点陷阱）
-      const readVal = () => page.evaluate(() =>
-        Number(document.getElementById('captcha_chip_default')?.getAttribute('aria-valuenow') || 0));
       let cur = await readVal();
       const probe0 = cur;
       await page.keyboard.press('ArrowRight');
@@ -559,18 +727,7 @@ async function doRenew(page) {
         // ⚠️ 之前失败的原因：点 track 只 apply 不 submit，随后点 chip 提交时
         //    value 已被下一步的 apply 改偏了。⇒ 改成「只在 track 上迭代逼近，
         //    精确命中后再点 chip 提交」。
-        const handleW = meta.handleW || 24;
-        const span = Math.max(1, meta.trackW - handleW);
-        const vmax = meta.vmax || 204;
-        const trackTo = async (want) => {
-          const f = Math.max(0, Math.min(1, want / vmax));
-          const x = meta.trackX + handleW / 2 + f * span;
-          await moveHuman(page, x, meta.trackCy);
-          await page.mouse.down();
-          await page.waitForTimeout(90);
-          await page.mouse.up();
-          await page.waitForTimeout(600);
-        };
+        // trackTo / span / handleW / vmax 已提升到本分支外（键盘路径也要用）
         cur = await readVal();
         // 二分收缩：每次按当前误差方向重定位，最多 8 次
         for (let g2 = 0; g2 < 8 && Math.abs(cur - target) > 1; g2++) {
@@ -585,7 +742,12 @@ async function doRenew(page) {
         if (lastPuzzle === sig) {
           rounds.push({ stage, kind, value: target, note: '定位重复，换题' });
           log(`  阶段${stage + 1} ${kind} 定位重复，换题`);
-          await switchKind(page);
+          const swOk = await switchKind(page);
+          if (swOk) switchFails = 0;
+          else if (++switchFails > 1) {
+            return { ok: false, why: 'SWITCH_DEAD', rounds,
+                     note: '换题按钮连续无效，重开会话重摇题型' };
+          }
           continue;
         }
         lastPuzzle = sig;
@@ -619,27 +781,65 @@ async function doRenew(page) {
               await page.mouse.click(nb.x, nb.y);
               await page.waitForTimeout(1300);
               stNow = await readState(page);
-              if (stNow.tokenLen > 0 || stNow.stage !== beforeStage) break;
+              // ⚠️ 不用 stage 判成功（答错后服务端会重发同 stage 新题，stage 会倒退）
+              if (stNow.tokenLen > 0) break;
             }
-            if (stNow.tokenLen > 0 || stNow.stage !== beforeStage) break;
+            if (stNow.tokenLen > 0) break;
           }
+          // 扫描失败后把 chip 停回最优解，避免下一阶段起点错位
+          await trackTo(target);
           cur = await readVal();
         }
         rounds.push({ stage, kind, value: target, vmax: meta.vmax, via: 'track+scan',
-                      chipNow: cur, stageAfter: stNow.stage, tokenLen: stNow.tokenLen });
+                      chipNow: cur, stageAfter: stNow.stage, tokenLen: stNow.tokenLen,
+                      grabVia, grabBytes });
         log(`  阶段${stage + 1} ${kind} value=${target} chip→${cur} ${stNow.stage}` +
             (stNow.tokenLen > 0 ? ' ★token' : ''));
       } else {
+        // ⚠️ 实测 bug：ArrowLeft/Right **步进是 2**（不是 1）。
+        //   旧循环条件 `|cur-target|>1` 在奇偶差时会死循环到 guard 耗尽仍差 1，
+        //   然后拿错值提交 ⇒ 日志里大量 "目标 179 chip→83"。
+        // 修法：① 用 Shift 做粗调（协议：Shift = vmax/18）；② 收敛判据放宽到 ±2；
+        //      ③ 退出后**必须校验**，偏差 >2 就改走 trackTo（滑轨）精确逼近。
+        const STEP = 2;
         let guard = 0;
-        while (Math.abs(cur - target) > 1 && guard++ < 60) {
-          await page.keyboard.press(cur < target ? 'ArrowRight' : 'ArrowLeft');
-          if (guard % 8 === 0) await page.waitForTimeout(150);
+        while (Math.abs(cur - target) > STEP && guard < 40) {
+          const err = target - cur;
+          if (Math.abs(err) > 20) {
+            // 大偏差：Shift 粗调（一次 vmax/18）
+            await page.keyboard.press(err > 0 ? 'Shift+ArrowRight' : 'Shift+ArrowLeft');
+          } else {
+            await page.keyboard.press(err > 0 ? 'ArrowRight' : 'ArrowLeft');
+          }
+          if (guard % 6 === 0) await page.waitForTimeout(120);
           cur = await readVal();
+          guard++;
         }
-        await page.keyboard.press('Enter');
-        await page.waitForTimeout(1500);
-        rounds.push({ stage, kind, value: target, vmax: meta.vmax, chipNow: cur, iters: guard, via: 'keyboard' });
-        log(`  阶段${stage + 1} ${kind} 目标 value=${target} chip→${cur} (${guard} 次)`);
+        // 键盘没能精确命中（奇偶差 / 焦点丢失）⇒ 记录并交给下面的滑轨兜底
+        const kbErr = Math.abs(cur - target);
+        rounds.push({ stage, kind, value: target, vmax: meta.vmax, chipNow: cur,
+                      iters: guard, kbErr, via: 'keyboard' });
+        if (kbErr > 2) {
+          log(`  阶段${stage + 1} ${kind} 键盘未精确命中（差 ${kbErr}），走滑轨`);
+        } else {
+          await page.keyboard.press('Enter');
+          await page.waitForTimeout(1500);
+          log(`  阶段${stage + 1} ${kind} 目标 value=${target} chip→${cur} (${guard} 次) ★已提交`);
+          cur = await readVal();
+          if (cur === target) { /* 提交成功，继续下一阶段 */ }
+        }
+        // 键盘未精确命中 ⇒ 走滑轨精确逼近后再提交（否则拿错值提交，必错）
+        if (Math.abs(cur - target) > 2) {
+          const fixed = await trackNudge(target);
+          rounds.push({ stage, kind, note: 'keyboard-miss->track', from: cur, to: fixed, target });
+          log(`  阶段${stage + 1} ${kind} 滑轨兜底 ${cur} → ${fixed}（目标 ${target}）`);
+          cur = fixed;
+          if (Math.abs(cur - target) <= 2) {
+            await page.keyboard.press('Enter');
+            await page.waitForTimeout(1500);
+            log(`  阶段${stage + 1} ${kind} 滑轨命中 ${cur} ★已提交`);
+          }
+        }
       }
 
     } else if (kind === 'match') {
@@ -669,7 +869,12 @@ async function doRenew(page) {
       if (lastMatch === sig) {
         rounds.push({ stage, kind, pairs: sol.pairs, note: '配对重复，换题' });
         log(`  阶段${stage + 1} match 配对重复，换题`);
-        await switchKind(page);
+        const swOk = await switchKind(page);
+        if (swOk) switchFails = 0;
+        else if (++switchFails > 1) {
+          return { ok: false, why: 'SWITCH_DEAD', rounds,
+                   note: '换题按钮连续无效，重开会话重摇题型' };
+        }
         continue;
       }
       lastMatch = sig;
