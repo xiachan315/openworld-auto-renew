@@ -462,26 +462,34 @@ async function doRenew(page) {
         //   2026-10-04 本机实测：连点换题 8 次 ⇒ 8 种不同题型，key 只占 1/9。
         //   正确判据是 meta.id / meta.kind（见 puzzleFingerprint）。
         // ⇒ 抽到 key 就换，最多换 12 次；抽到别的题型立刻清零。
-        if (++keySwitches > 12) {
-          return { ok: false, why: 'KEY_STUCK', rounds,
-                   note: `连换 ${keySwitches} 次仍抽到 key（本轮放弃，等下次 cron）` };
+        // 换题 3 次仍抽到 key ⇒ 结束本会话，让多会话重试去**重摇题型**
+        //（实测 run#18：会话 1 在 key 上耗掉 13 阶段，其余会话抽到 puzzle/odd 都能走）
+        if (++keySwitches > 3) {
+          return { ok: false, why: 'KEY_NEED_RESHUFFLE', rounds,
+                   note: `换题 ${keySwitches} 次仍抽到 key，重开会话重摇题型` };
         }
         rounds.push({ stage, kind, skipped: 'unreliable', keySwitch: keySwitches });
         log(`  阶段${stage + 1} key 不可靠，换题（第 ${keySwitches} 次）`);
         await switchKind(page);
-        // 换题后看新题型：不是 key 就清零（说明换题真的生效了）
+        // 换题后**必须重读 meta**；没换掉就返回，不能原地 continue 转圈
         const newKind = await page.evaluate(() => window.__owCapMeta?.kind || null);
         if (newKind && newKind !== 'key') {
           log(`  → 已换到 ${newKind} 题型，清零 key 计数`);
           keySwitches = 0;
         } else {
-          await page.waitForTimeout(2000);
+          log('  → 换题未生效，结束本会话');
+          return { ok: false, why: 'KEY_STUCK', rounds,
+                   note: '换题按钮对本会话已失效，需重开会话' };
         }
         continue;
       } else {
         // 拼块宽度必须从 DOM 的 chip style.width 读（puzzle=32% / key=24%，不能猜）
         const pw = Math.round((meta.chipWPct / 100) * 300);
-        const sol = solveGap(img, { w: 300, h: 160, vmax: meta.vmax, pw, px: 4 });
+        // ★ meta.px / meta.py 从页面里读（solveGap 依赖 py 限定 y 搜索范围，
+        //   硬编码 px:4 会把搜索起点推到 110，直接漏掉左半张图的答案）。
+        const cm = await page.evaluate(() => window.__owCapMeta || null);
+        const sol = solveGap(img, { w: 300, h: 160, vmax: meta.vmax, pw, ph: pw,
+                                    px: cm?.px, py: cm?.py });
         if (sol.i === null) {
           const sw = page.locator('#captcha_switch_default').first();
           const bb = await sw.boundingBox();
