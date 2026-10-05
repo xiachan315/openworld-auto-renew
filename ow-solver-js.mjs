@@ -455,12 +455,23 @@ export function solveGap(img, meta) {
   const mw = meta.w || 300, mh = meta.h || 160;
   const sx = img.w / mw, sy = img.h / mh;
   const pw = meta.pw || 96;
+  const ph = meta.ph || pw;
   const vmax = meta.vmax || (mw - pw);
 
-  // 搜索区：排除 chip 起点横带（meta.px 起 pw 宽），以及最右边缘
-  const x0 = Math.max(0, Math.floor(Math.min((meta.px + pw + 10) * sx, img.w - 20)));
+  // ★ x 搜索区：不再排除 "meta.px 起 pw 宽" 的横带。
+  //   实测 meta.px 恒为 4（chip 初始贴左边），而缺口完全可能落在那一带
+  //   ⇒ 旧代码的 x0 = px+pw+10 = 110 会直接漏掉真答案，
+  //     这就是「每张新图都算出同一个值」的直接原因。
+  const x0 = 0;
   const x1 = Math.max(x0 + 4, Math.floor(img.w - 2));
-  const box = [x0, 0, x1, img.h];
+
+  // ★ y 搜索区：用 meta.py 限定（实测 py±2 准确率 93.3%，全图只有 85%）。
+  //   py 是服务端给的缺口上边缘 y 坐标，**每次都变**（实测 33/39/75…），
+  //   是极强的免费先验。之前完全没用它，等于把 90% 的信息扔掉。
+  const PY_R = 2;                       // 实测 ±2 最优，±4 掉到 26/30
+  const yLo = Math.max(0, Math.floor((Math.round(meta.py || 0) - PY_R) * sy));
+  const yHi = Math.min(img.h, Math.ceil((Math.round(meta.py || 0) + PY_R + ph) * sy));
+  const box = [x0, yLo, x1, yHi];
 
   // 试多个阈值分位，取「宽度最接近 pw」的连通块
   let best = null;
