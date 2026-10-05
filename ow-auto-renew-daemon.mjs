@@ -321,8 +321,8 @@ async function switchKind(page) {
   await moveHuman(page, cx, cy);
   await page.mouse.click(cx, cy);
   // 服务端可能限流 / 冷却 ⇒ 轮询等新题就绪
-  for (let i = 0; i < 20; i++) {
-    await page.waitForTimeout(700);
+  for (let i = 0; i < 10; i++) {
+    await page.waitForTimeout(400);
     const stNow = await readState(page);
     if (stNow.tokenLen > 0) return true;               // 答案已过 = 成功
     if (stNow.stage !== beforeStage) return true;     // 阶段推进 = 成功
@@ -359,8 +359,16 @@ async function doRenew(page) {
   let lastMatch = null;
   let lastOdd = null;
   let lastPuzzle = null;
-  // 24 不够：换题也消耗阶段（实测一轮里 key/rotate/match 各换了好几次）
-  for (let stage = 0; stage < 60; stage++) {
+  // ★ 时间预算：换题路径会消耗大量阶段（60 阶段 × 换题等待 ≈ 25 分钟，
+  //   会撞 Actions 的 job timeout）。必须自己限时，到点就带着已有进度返回。
+  //   24 不够（换题也占阶段），但也不能无限换。
+  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 15 * 60 * 1000);
+  const t0 = Date.now();
+  for (let stage = 0; stage < 40; stage++) {
+    if (Date.now() - t0 > DEADLINE_MS) {
+      return { ok: false, why: 'ROUND_TIMEOUT', rounds,
+               note: `本轮用时预算 ${Math.round((Date.now()-t0)/1000)}s 已到，放弃（已尝试 ${stage} 阶段）` };
+    }
     st = await readState(page);
     if (st.tokenLen > 0) break;
     if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds };
