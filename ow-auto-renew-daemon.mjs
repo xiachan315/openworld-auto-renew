@@ -164,9 +164,19 @@ async function grabChipPng(page) {
     if (!c) return null;
     const r = c.getBoundingClientRect();
     if (r.width < 8 || r.height < 8) return null;
+    // ★ 必须确认 chip 完全落在视口内，否则 page.screenshot({clip}) 会截到
+    //   视口外的空白 ⇒ 拿到非 PNG 数据（实测 rotate 题型 20 次全部 not a PNG）。
+    const vw = window.innerWidth, vh = window.innerHeight;
+    if (r.x < 0 || r.y < 0 || r.right > vw || r.bottom > vh) return null;
     return { x: r.x, y: r.y, width: r.width, height: r.height };
   });
   if (!box) return null;
+  // 优先用元素截图（Playwright 会自动滚动到元素）
+  try {
+    const png = await page.locator('#captcha_chip_default').first().screenshot({ type: 'png' });
+    const b64 = png.toString('base64');
+    if (b64 && b64.length > 200) return b64;
+  } catch (e) { /* 退到 clip */ }
   try {
     const png = await page.screenshot({
       clip: { x: box.x, y: box.y, width: box.width, height: box.height },
