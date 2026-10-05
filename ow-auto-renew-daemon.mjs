@@ -714,7 +714,7 @@ async function doRenew(page) {
 }
 
 async function once() {
-  const { browser, page } = await launch();
+  let { browser, page } = await launch();
   try {
     await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(4000);
@@ -737,7 +737,52 @@ async function once() {
                note: `距到期 ${hl.toFixed(1)}h > 阈值 ${THRESHOLD_H}h，本轮不续` };
     }
 
-    const r = await doRenew(page);
+    // ★ 多会话重试：换题在坏会话里会失效（实测 run#17：40 阶段全是 puzzle，
+
+    //   换题后题型不变 => 换题按钮对同一会话已无效）。
+
+    //   正确策略 = **重开浏览器会话重摇**，而不是在原地空转。
+
+    // 依据：7 天周期 + 24h 冷却 ⇒ 一周期内 7 次机会；题型 5 选 1、已通 4 种
+
+    //   ⇒ 单次 4/5，7 次全败 = (1/5)^7 = 0.0013%。
+
+    const SESSIONS = Number(process.env.OW_SESSIONS || 4);
+
+    let r = { ok: false, why: 'NO_ATTEMPT', rounds: [], sessions: [] };
+
+    for (let si = 0; si < SESSIONS; si++) {
+
+      if (si > 0) {
+
+        log(`换新会话（第 ${si + 1}/${SESSIONS} 次）`);
+
+        // ★ 整个重开：browser + page + cookie 注入 + 打开面板。
+        //   换题按钮在同一会话里会失效（实测 40 阶段全是 puzzle，
+        //   换题后 meta.id 不变），只有新会话才能重新摇题型。
+        try { await browser.close(); } catch (e) {}
+
+        const s = await launch();
+
+        if (!s || !s.page) break;
+
+        browser = s.browser; page = s.page;
+
+        await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        await page.waitForTimeout(4000);
+
+      }
+
+      r = await doRenew(page);
+
+      r.sessions = si + 1;
+
+      if (r.ok || r.throttled || r.skipped) break;      // 成功/冷却/跳过 ⇒ 无需再试
+
+      if (r.rounds && r.rounds.length) log(`会话 ${si + 1} 结束：${r.rounds.length} 阶段（${r.why || '未通过'}），重开会话`);
+
+    }
     const after = await readRenew(page);
     return { ...r, hoursLeft: hl, renewsBefore: info.renews, after };
   } finally {
