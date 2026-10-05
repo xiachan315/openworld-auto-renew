@@ -1,0 +1,72 @@
+name: Openworld 自动续期
+
+on:
+  schedule:
+    # 每 2 小时跑一次。脚本内部有 72h 阈值：不到窗口期就只读跳过（不消耗任何配额）。
+    # 提频原因：验证码 key 题型解不出（KEY_STUCK），靠多次重试碰可解题型。
+    # 平台规则「每 24h 可免费续 1 次」，所以一天最多成功续一次，多跑几次只是读状态。
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略 48h 阈值，强制尝试续期（用于验证链路）'
+        required: false
+        default: '0'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openworld-renew
+  cancel-in-progress: false
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Clerk 会话 cookie（base64 的 JSON 数组）。在 repo 的
+      # Settings -> Secrets and variables -> Actions 里加名为 OW_COOKIES_B64 的 secret。
+      OW_COOKIES_B64: ${{ secrets.OW_COOKIES_B64 }}
+      # Telegram 通知（bot token + chat id 都放 Secret，不入库）
+      TG_TOKEN: ${{ secrets.TG_TOKEN }}
+      TG_CHAT: ${{ secrets.TG_CHAT }}
+      # 距到期多少小时内才真的续（默认 48）
+      OW_THRESHOLD_H: ${{ github.event.inputs.force == '1' && '9999' || '72' }}
+      # 验证码失败预算有限，重试最多 2 次
+      OW_MAX_TRY: '2'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装依赖
+        run: npm install --no-fund --no-audit playwright-core@1.63.0
+
+      - name: 安装 Chromium
+        run: npx playwright-core install --with-deps chromium
+
+      - name: 检查凭据
+        run: |
+          if [ -z "$OW_COOKIES_B64" ]; then
+            echo "::error::缺少 secret OW_COOKIES_B64（Clerk 会话 cookie）"
+            exit 1
+          fi
+          echo "cookie 长度: $(echo -n "$OW_COOKIES_B64" | wc -c) base64 字符"
+
+      - name: 跑续期
+        run: node ow-auto-renew-daemon.mjs once
+
+      - name: 上传诊断截图（仅失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ow-renew-debug
+          path: |
+            *.png
+            *.log
+          if-no-files-found: ignore
+          retention-days: 7
