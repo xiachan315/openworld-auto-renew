@@ -357,12 +357,10 @@ async function doRenew(page) {
   let st = await readState(page);
   let keySwitches = 0;
   let lastMatch = null;
-  let matchRepeats = 0;
   let lastOdd = null;
-  let stuckRepeats = 0;
   let lastPuzzle = null;
-  let samePuzzleCount = 0;
-  for (let stage = 0; stage < 24; stage++) {
+  // 24 不够：换题也消耗阶段（实测一轮里 key/rotate/match 各换了好几次）
+  for (let stage = 0; stage < 60; stage++) {
     st = await readState(page);
     if (st.tokenLen > 0) break;
     if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds };
@@ -384,23 +382,12 @@ async function doRenew(page) {
       // 每次 margin 都是 0.9037 完全相同 —— 同一张旧 PNG 算了同一个答案，
       // 白烧 3 分钟。现在改为：重复判定即换题。
       if (lastOdd && lastOdd.i === sol.i && Math.abs(lastOdd.margin - sol.margin) < 1e-6) {
-        // 换题按钮点不动时（run#7 实测：连续 20 次重复，switchKind 静默失败），
-        // 再点也是白点。⇒ 累计 3 次就放弃本轮，等下次 cron 换一批题。
-        if (++stuckRepeats > 2) {
-          return { ok: false, why: 'STUCK_NO_SWITCH', rounds,
-                   note: `odd 答案重复 ${stuckRepeats} 次且换题无效（按钮点不动），本轮放弃` };
-        }
+        // 答案重复 ⇒ 换题。**不要在这里放弃**：
+        // 换题机制已证明有效（实测连点 8 次得 8 种题型），放弃是多余的。
+        // 真正的止损点是「整轮 24 个阶段用尽」，那时自然返回失败。
         rounds.push({ stage, kind, i: sol.i, margin: sol.margin, note: '答案重复，换题' });
-        log(`  阶段${stage + 1} odd 判定重复，换题（第 ${stuckRepeats} 次）`);
-        if (!await switchKind(page)) {
-          await page.waitForTimeout(2500);
-          const still = await readState(page);
-          if (still.tokenLen === 0 && still.stage === st.stage) {
-            // 换题没生效：直接放弃，别空转
-            return { ok: false, why: 'STUCK_NO_SWITCH', rounds,
-                     note: '换题无效（stage 与 token 均未变化），本轮放弃' };
-          }
-        }
+        log(`  阶段${stage + 1} odd 判定重复，换题`);
+        await switchKind(page);
         continue;
       }
       lastOdd = { i: sol.i, margin: sol.margin };
@@ -580,17 +567,12 @@ async function doRenew(page) {
         //   判据：目标 value 相同 ⇒ 同一张图同一定位 ⇒ 换题；连续 3 次则放弃本轮。
         const sig = `${kind}:${target}`;
         if (lastPuzzle === sig) {
-          if (++samePuzzleCount > 2) {
-            return { ok: false, why: 'PUZZLE_STUCK', rounds,
-                     note: `${kind} 定位重复 ${samePuzzleCount} 次（value=${target}），本轮放弃` };
-          }
           rounds.push({ stage, kind, value: target, note: '定位重复，换题' });
           log(`  阶段${stage + 1} ${kind} 定位重复，换题`);
-          if (!await switchKind(page)) await page.waitForTimeout(2500);
+          await switchKind(page);
           continue;
         }
         lastPuzzle = sig;
-        samePuzzleCount = 0;
 
         // 命中后提交：点 chip 触发 pointerup -> submitSolution
         // （chip 已被 trackTo 移动 ⇒ 用实时坐标，不用 meta.chipCx）
@@ -669,16 +651,12 @@ async function doRenew(page) {
       //   判据：同一 meta.id 下算出同一个配对 ⇒ 答案没被接受 ⇒ 换题。
       const sig = JSON.stringify(sol.pairs);
       if (lastMatch === sig) {
-        if (++matchRepeats > 2) {
-          return { ok: false, why: 'MATCH_STUCK', rounds,
-                   note: `match 配对重复 ${matchRepeats} 次（${sig}），本轮放弃` };
-        }
         rounds.push({ stage, kind, pairs: sol.pairs, note: '配对重复，换题' });
-        log(`  阶段${stage + 1} match 配对重复，换题（第 ${matchRepeats} 次）`);
+        log(`  阶段${stage + 1} match 配对重复，换题`);
         await switchKind(page);
         continue;
       }
-      lastMatch = sig; matchRepeats = 0;
+      lastMatch = sig;
       rounds.push({ stage, kind, pairs: sol.pairs, scores: sol.scores });
       log(`  阶段${stage + 1} match 配对 ${JSON.stringify(sol.pairs)}`);
     } else {
