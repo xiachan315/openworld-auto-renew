@@ -356,6 +356,8 @@ async function doRenew(page) {
   const rounds = [];
   let st = await readState(page);
   let keySwitches = 0;
+  let lastMatch = null;
+  let matchRepeats = 0;
   let lastOdd = null;
   let stuckRepeats = 0;
   let lastPuzzle = null;
@@ -663,6 +665,20 @@ async function doRenew(page) {
         await moveHuman(page, bpt.x, bpt.y); await page.mouse.click(bpt.x, bpt.y);
         await page.waitForTimeout(500);
       }
+      // ★ 答错就在原地重复（实测 run#14：match 同一配对重复 17 次）。
+      //   判据：同一 meta.id 下算出同一个配对 ⇒ 答案没被接受 ⇒ 换题。
+      const sig = JSON.stringify(sol.pairs);
+      if (lastMatch === sig) {
+        if (++matchRepeats > 2) {
+          return { ok: false, why: 'MATCH_STUCK', rounds,
+                   note: `match 配对重复 ${matchRepeats} 次（${sig}），本轮放弃` };
+        }
+        rounds.push({ stage, kind, pairs: sol.pairs, note: '配对重复，换题' });
+        log(`  阶段${stage + 1} match 配对重复，换题（第 ${matchRepeats} 次）`);
+        await switchKind(page);
+        continue;
+      }
+      lastMatch = sig; matchRepeats = 0;
       rounds.push({ stage, kind, pairs: sol.pairs, scores: sol.scores });
       log(`  阶段${stage + 1} match 配对 ${JSON.stringify(sol.pairs)}`);
     } else {
