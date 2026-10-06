@@ -2,41 +2,32 @@ name: Openworld 自动续期
 
 on:
   schedule:
-    # ★★★ 2026-10-06 改版：从「每天固定一次」改为「每 2 小时唤醒 + 随机时段闸门」。
+    # ★★★ 2026-10-06 第二版：改成「高频唤醒 + 当日随机时刻 + 当天只跑一次」。
     #
-    # 为什么改（用户诉求）：原来 `23 8 * * *` 是雷打不动的 UTC 08:23（北京 16:23）。
-    #   「每天都在同一分钟出现同一种自动化行为」本身就是一条显眼的机器人指纹 ——
-    #   出口 IP 每轮都换（住宅节点随机）只解决了网络维度，时间维度仍是规律的。
-    #   用户明确要求：别每天固定一个时间点，免得被风控盯上。
+    # 为什么再改（实测结论）：
+    #   ① GitHub 原生 schedule 只有 ±分钟级精度，且高负载时会 drop；
+    #   ② 之前辅以 Cloudflare Worker 做外部触发器，但该账号的 Workers 运行时
+    #      当天整体异常（连最小 hello-world worker 都返回 Error 1101），
+    #      cron 触发器无法投递 ⇒ 外部触发器这条路不可依赖；
+    #   ③ 只跑 12 次/天时，只要那一次被 drop，当天就彻底没机会。
     #
-    # 怎么改：GitHub 的 `schedule` 只支持固定 cron，无法直接写「随机」。
-    #   所以这里改成**每 2 小时唤醒一次**（UTC 00/02/…/22，共 12 个窗口），
-    #   再由第一个 job `gate` 用「当天 UTC 日期」做 sha256 种子，确定性地
-    #   选出今天唯一的目标窗口；只有真正命中那个窗口的 run 才会继续跑，
-    #   其余 11 次在 gate 里就地退出 —— 不装依赖、不下载 Chromium、不碰目标站，
-    #   每次约 10~15 秒。
-    #   ⇒ 实际执行时刻在一天 12 个窗口里随机，而不是固定的一分钟。
+    # 现在的做法：每 20 分钟唤醒一次（72 次/天），用「当天 UTC 日期」的 sha256
+    #   选出一个 0~71 的随机时段 ⇒ 当天目标时刻。过目标时刻后的**第一次**唤醒
+    #   才真正执行；并用 actions/cache 打一个当天标记，保证当天不会重复执行。
+    #   ⇒ 单次被 drop 不影响（后面还有很多次唤醒）；执行时刻每天随机、不固定。
     #
-    # 为什么是每 2 小时而不是更高频：平台有「24h 冷却」，每 24h 只能成功续 1 次。
-    #   再高频也不会多成功一次，只会徒增 run 数。12 个窗口足够把执行时刻打散。
-    #
-    # 为什么用「日期种子」而不是 Math.random()：同一天会被唤醒 12 次，
-    #   必须 12 次算出同一个答案，否则永远撞不上；而且确定性意味着事后可复现
-    #   （能算出「那天本该几点跑」）。
-    #
-    # 阈值：workflow 侧给 72h，daemon 内部还会兜到 120h ⇒ 到期前 5 天进入窗口，
-    #   约 5 次机会；题型在 5 种里随机、已通全部题型 ⇒ 全败概率极低。
-    #   若某天那一次 schedule 恰好被 GitHub 丢弃（高负载时会 drop），
-    #   还有前后几天的窗口兜底。
-    - cron: '17 */2 * * *'
+    # 时间维度的随机性由两层构成：①上面的「当日随机时刻」②daemon 内的
+    #   OW_JITTER_MAX 抖动（命中后再随机等 0~20 分钟）。出口 IP 每轮随机（住宅节点）
+    #   + 时间随机 ⇒ 不再是「每天同一分钟同一种行为」的机器人指纹。
+    - cron: '*/20 * * * *'
   workflow_dispatch:
     inputs:
       force:
         description: '忽略阈值，强制尝试续期（用于验证链路）'
         required: false
         default: '0'
-      # 外部调度器（Cloudflare Worker）自动触发时置 1。
-      # 置 1 时不再豁免闸门，而是同样走「日期种子选出的随机窗口」判定，
+      # 外部调度器（如 Cloudflare Worker）自动触发时置 1。
+      # 置 1 时不再豁免闸门，而是同样走「当日随机时刻」判定，
       # 否则每次外部触发都会跑完整续期流程。
       auto:
         description: '外部调度器自动触发；置 1 时同样走随机闸门'
@@ -45,42 +36,73 @@ on:
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: openworld-renew
   cancel-in-progress: false
 
 jobs:
-  # ★★★ 随机时段闸门（2026-10-06）
-  #   把「固定时刻」变成「一天内 12 个窗口里随机一个」。
-  #   手动触发（workflow_dispatch）时恒放行，方便随时验证链路。
+  # ★★★ 随机时刻闸门（2026-10-06 第二版）
+  #   ① 算出今天的目标时刻（日期种子 ⇒ 每天不同、且同一天 72 次唤醒答案一致）
+  #   ② 没到目标时刻 ⇒ 空跑退出（不装依赖、不下 Chromium、不碰目标站）
+  #   ③ 到了目标时刻 ⇒ 再查当日标记 cache：命中过就直接空跑（当天只执行一次）
   gate:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      run: ${{ steps.decide.outputs.run }}
+      run: ${{ steps.final.outputs.run }}
+      date: ${{ steps.when.outputs.date }}
     steps:
-      - name: 决定今天在哪个窗口执行
-        id: decide
+      - name: ① 计算今天的随机时刻
+        id: when
         run: |
           AUTO="${{ github.event.inputs.auto }}"
+          SEED=$(date -u +%Y%m%d)
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$AUTO" != "1" ]; then
-            echo "run=1" >> "$GITHUB_OUTPUT"
-            echo "· 手动触发 ⇒ 跳过闸门，直接执行"
+            echo "date=$SEED" >> "$GITHUB_OUTPUT"
+            echo "time_ok=1" >> "$GITHUB_OUTPUT"
+            echo "· 人工手动触发 ⇒ 跳过闸门，直接执行"
             exit 0
           fi
-          SEED=$(date -u +%Y%m%d)
           H=$(printf '%s' "$SEED" | sha256sum | cut -c1-8)
-          TARGET=$(( 16#$H % 12 ))
-          NOW=$(( 10#$(date -u +%H) / 2 ))
-          echo "日期=$SEED  目标窗口=$TARGET（UTC $(printf '%02d' $((TARGET*2))):17）  当前窗口=$NOW"
-          if [ "$NOW" -eq "$TARGET" ]; then
-            echo "run=1" >> "$GITHUB_OUTPUT"
-            echo "✅ 命中今天的随机窗口 $TARGET ⇒ 继续执行"
+          SLOT=$(( 16#$H % 72 ))
+          TARGET_MIN=$(( SLOT * 20 ))
+          NOW_MIN=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+          echo "date=$SEED" >> "$GITHUB_OUTPUT"
+          printf '日期=%s  目标时刻=%02d:%02d(UTC)  当前=%02d:%02d(UTC)\n' \
+            "$SEED" $((TARGET_MIN/60)) $((TARGET_MIN%60)) $((NOW_MIN/60)) $((NOW_MIN%60))
+          if [ "$NOW_MIN" -ge "$TARGET_MIN" ]; then
+            echo "time_ok=1" >> "$GITHUB_OUTPUT"
+            echo "✅ 已过今天的随机时刻 ⇒ 进入当日去重检查"
           else
-            echo "run=0" >> "$GITHUB_OUTPUT"
-            echo "⏭ 未命中（今天窗口=$TARGET，当前=$NOW）⇒ 空跑退出：不装依赖、不碰目标站"
+            echo "time_ok=0" >> "$GITHUB_OUTPUT"
+            echo "⏭ 还没到今天的随机时刻 ⇒ 空跑退出：不装依赖、不碰目标站"
           fi
+
+      - name: ② 查当天是否已经执行过
+        id: mark
+        if: steps.when.outputs.time_ok == '1'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ow-try
+          key: ow-try-${{ steps.when.outputs.date }}
+          lookup-only: true
+
+      - name: ③ 决定今天跑不跑
+        id: final
+        run: |
+          if [ "${{ steps.when.outputs.time_ok }}" != "1" ]; then
+            echo "run=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "${{ steps.mark.outputs.cache-hit }}" = "true" ]; then
+            echo "run=0" >> "$GITHUB_OUTPUT"
+            echo "⏭ 今天已经执行过（当日标记命中）⇒ 空跑退出"
+            exit 0
+          fi
+          echo "run=1" >> "$GITHUB_OUTPUT"
+          echo "✅ 今天首次到达随机时刻 ⇒ 执行续期"
 
   renew:
     needs: gate
@@ -102,8 +124,7 @@ jobs:
       # 距到期多少小时内才真的续（daemon 侧还会兜底到 120）
       OW_THRESHOLD_H: ${{ github.event.inputs.force == '1' && '9999' || '72' }}
       # ★ 随机抖动（分钟）：命中窗口后、接触目标站前再随机等 0~20 分钟，
-      #   让「读面板 / 解验证码 / 续期」的时刻在窗口内也带分钟级随机，
-      #   而不是卡在窗口起点的同一分钟。
+      #   让「读面板 / 解验证码 / 续期」的时刻在随机时刻之后再抖动一层。
       OW_JITTER_MAX: '20'
       # 验证码失败预算有限，重试最多 2 次
       OW_MAX_TRY: '2'
@@ -113,6 +134,19 @@ jobs:
       OW_SESSIONS: '4'
 
     steps:
+      # ★ 先打「今天已尝试」标记：无论后面成功失败，当天都不再重复触发。
+      #   重试交给 daemon 内部（OW_MAX_TRY / OW_SESSIONS）+ 后续日期的窗口。
+      - name: 标记今天已尝试
+        run: |
+          mkdir -p .ow-try
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .ow-try/tried.txt
+          cat .ow-try/tried.txt
+      - name: 保存当日标记
+        uses: actions/cache/save@v4
+        with:
+          path: .ow-try
+          key: ow-try-${{ needs.gate.outputs.date }}
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
