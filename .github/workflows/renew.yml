@@ -35,6 +35,13 @@ on:
         description: '忽略阈值，强制尝试续期（用于验证链路）'
         required: false
         default: '0'
+      # 外部调度器（Cloudflare Worker）自动触发时置 1。
+      # 置 1 时不再豁免闸门，而是同样走「日期种子选出的随机窗口」判定，
+      # 否则每次外部触发都会跑完整续期流程。
+      auto:
+        description: '外部调度器自动触发；置 1 时同样走随机闸门'
+        required: false
+        default: '0'
 
 permissions:
   contents: read
@@ -56,7 +63,8 @@ jobs:
       - name: 决定今天在哪个窗口执行
         id: decide
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          AUTO="${{ github.event.inputs.auto }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$AUTO" != "1" ]; then
             echo "run=1" >> "$GITHUB_OUTPUT"
             echo "· 手动触发 ⇒ 跳过闸门，直接执行"
             exit 0
