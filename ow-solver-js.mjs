@@ -358,6 +358,12 @@ export function solveOdd(img, items, metaW = 300, metaH = 160) {
 
   return {
     i: best,
+    // ★ 2026-10-06 新增：按"离群程度"排序的**全部候选**（order 已是 comb 升序，
+    //   即"最离群"在前）。调用方拿它做**穷举**：odd 只有 4 个候选，
+    //   求解器首猜实测只有约 40% 命中（run#26：5 次提交 2 次推进），
+    //   但按 rank 逐个试 ⇒ 4 次内**必然命中**，把 odd 从"运气"变成"确定"。
+    rank: order.slice(),
+    comb: comb.map((v) => Math.round(v * 10000) / 10000),
     margin: Math.round(margin * 10000) / 10000,
     agree: shapeBest === best,
     regime,
@@ -547,7 +553,35 @@ export function solveMatch(img, meta) {
     }
     if (bestJ >= 0) { used[bestJ] = true; pairs.push([i, bestJ]); }
   }
-  return { pairs, scores: pairs.map(([i, j]) => Math.round((0.7 * cosSim(lg[i], rg[j]) + 0.3 * maskSim(lm[i], rm[j])) * 1000) / 1000) };
+  const sc = (i, j) => 0.7 * cosSim(lg[i], rg[j]) + 0.3 * maskSim(lm[i], rm[j]);
+  const base = { pairs, scores: pairs.map(([i, j]) => Math.round(sc(i, j) * 1000) / 1000) };
+
+  // ★ 2026-10-06 新增：**全部配对方案**，按总分降序。
+  //   n=3 ⇒ 只有 3! = 6 种排列。求解器是贪心匹配，首猜命中率并不高
+  //   （run#26 里 match 连续「配对重复」= 首猜一直错）。
+  //   但 6 种里**必有一个是对的** ⇒ 调用方按 perms 顺序穷举，match 变成确定性通过。
+  //   n 过大时不全排列（阶乘爆炸），退化为只给贪心解。
+  if (n >= 2 && n <= 4 && R.length === n) {
+    const perms = [];
+    const walk = (cur, usedJ) => {
+      if (cur.length === n) {
+        let tot = 0;
+        for (let i = 0; i < n; i++) tot += sc(i, cur[i]);
+        perms.push({ pairs: cur.map((j, i) => [i, j]), score: Math.round((tot / n) * 1000) / 1000 });
+        return;
+      }
+      for (let j = 0; j < n; j++) {
+        if (usedJ[j]) continue;
+        usedJ[j] = true; cur.push(j);
+        walk(cur, usedJ);
+        cur.pop(); usedJ[j] = false;
+      }
+    };
+    walk([], new Array(n).fill(false));
+    perms.sort((a, b) => b.score - a.score);
+    base.perms = perms;
+  }
+  return base;
 }
 
 /**
