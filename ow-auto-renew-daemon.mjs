@@ -743,7 +743,10 @@ async function doRenew(page) {
   //   24 不够（换题也占阶段），但也不能无限换。
   // ★ 2026-10-06 调大：穷举每个 stage 要试 4~6 个候选，15 分钟不够走完 5~6 个 stage。
   //   job timeout 是 45 分钟，留足 28 分钟给本轮。
-  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 28 * 60 * 1000);
+  // ★ 单会话预算：run#27 里跑得最好的会话也只用了 5.6 分钟，
+  //   而耗尽换题预算的会话 1.4~2.2 分钟就结束了 ⇒ 5 分钟足够，
+  //   且能让 10 个会话塞进 36 分钟的全局预算里。
+  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 5 * 60 * 1000);
   const t0 = Date.now();
   for (let stage = 0; stage < 40; stage++) {
     if (Date.now() - t0 > DEADLINE_MS) {
@@ -1363,11 +1366,25 @@ async function once() {
 
     //   ⇒ 单次 4/5，7 次全败 = (1/5)^7 = 0.0013%。
 
-    const SESSIONS = Number(process.env.OW_SESSIONS || 4);
+    // ★ 2026-10-06 run#27 实测：换题预算是**按会话重置**的
+    //   （会话1 2.2min 耗尽、会话2 1.4min 耗尽、会话3 5.6min 跑到 STAGE 4/6 最好、
+    //    会话4 4.1min）⇒ **会话数就是"重摇题型"的次数**，是最直接的杠杆。
+    //   run#27 用 4 个会话只花了 13.3 分钟，而 job timeout 是 45 分钟 ⇒ 还有 3 倍余量。
+    //   提到 10 个会话 ≈ 30~35 分钟，仍留安全边界；
+    //   再加一层 TOTAL_BUDGET_MS 兜底，保证**总能在超时前带着结果返回**。
+    const SESSIONS = Number(process.env.OW_SESSIONS || 10);
+    const TOTAL_BUDGET_MS = Number(process.env.OW_TOTAL_BUDGET_MS || 36 * 60 * 1000);
+    const tStart = Date.now();
 
     let r = { ok: false, why: 'NO_ATTEMPT', rounds: [], sessions: [] };
 
     for (let si = 0; si < SESSIONS; si++) {
+      // 全局预算：到点就不再开新会话，带着当前结果体面返回
+      // （否则会被 45 分钟 job timeout 硬杀，连 JSON 结果和通知都拿不到）
+      if (si > 0 && Date.now() - tStart > TOTAL_BUDGET_MS) {
+        log(`全局预算 ${Math.round((Date.now() - tStart) / 1000)}s 已到，停止开新会话`);
+        break;
+      }
 
       if (si > 0) {
 
