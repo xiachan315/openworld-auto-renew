@@ -153,7 +153,15 @@ export function solveGap2(bgImg, chipImg, meta = {}) {
 }
 
 // ---------------- CLI 自测 ----------------
-if (process.argv[2]) {
+// ⚠️ 必须有 isMain 守卫：本文件被 daemon `import` 时，顶层代码照样执行，
+//    而 daemon 的 argv[2] 是子命令（'once'）⇒ 会被当成目录 readdir 直接崩
+//    （实测 run 37432597800：ENOENT scandir 'once'）。
+import { fileURLToPath } from 'node:url';
+const __isMain = (() => {
+  try { return !!process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]; }
+  catch (e) { return false; }
+})();
+if (__isMain && process.argv[2]) {
   const dir = process.argv[2];
   const files = fs.readdirSync(dir);
   const bgf = files.find((f) => /^bg\.(png|bin)$/.test(f) || /bg/.test(f));
