@@ -6,13 +6,10 @@
     "  renew.yml 改不动 ⇒ 把可调参数外置成这个普通文件，随时能改。",
     "优先级：本文件 > workflow 里的 env > 代码默认值。"
   ],
-
   "sessions": 12,
   "_sessions_note": "浏览器会话数。换题预算按会话重置 ⇒ 会话数 = 能重摇题型的次数，是最直接的杠杆。run#27 用 4 个会话最好跑到 STAGE 4/6。",
-
-  "roundBudgetMs": 270000,
+  "roundBudgetMs": 240000,
   "_roundBudgetMs_note": "单个会话的时间预算（毫秒，4.5 分钟）。耗尽换题预算的会话 1~2 分钟就结束；跑得好的 5~6 分钟。",
-
-  "totalBudgetMs": 2280000,
+  "totalBudgetMs": 2100000,
   "_totalBudgetMs_note": "全局预算（毫秒，38 分钟）。必须小于 workflow 的 timeout-minutes(45)，否则会被硬杀、连 Telegram 通知都发不出。"
 }
