@@ -491,8 +491,18 @@ async function launch() {
   //   GitHub runner 是 UTC ⇒ 不设这一项，通知里的到期时间就全错 8 小时。
   //   显式指定后，页面渲染、读数、通知三处天然一致，无需事后换算。
   const TZ_ID = process.env.OW_TZ || 'Asia/Shanghai';
+  // ★★视口宽度必须是 1920，不是 1280（2026-10-06 run#30 实测算出来的硬 bug）。
+  //
+  // 证据：日志 `阶段1 puzzle value=194 chip→85`（差 109），而同一次运行里
+  //      `目标 value=130 chip→129`（只差 1，完全正常）。
+  // 算一下就清楚：面板的验证码盒子在 x≈948.5~1248.5，chip 中心 chipCx≈1116。
+  //   · 目标 130 ⇒ 鼠标需走到 1116+130 = 1246 < 1280 ✅ 事件正常送达
+  //   · 目标 194 ⇒ 鼠标需走到 1116+194 = 1310 **> 1280** ❌ 鼠标出视口，
+  //     `pointermove` 不再送达，value 停在 85 就松手 ⇒ 提交了一个错答案。
+  // 值域上限 vmax=204（= 300-96），所以 1280 宽的视口**根本放不下大目标值的拖拽**。
+  // 加宽到 1920 后，最坏情况 1116+204=1320 < 1920，全程在屏内。
   const ctx = await browser.newContext({
-    userAgent: UA, locale: 'zh-CN', viewport: { width: 1280, height: 900 },
+    userAgent: UA, locale: 'zh-CN', viewport: { width: 1920, height: 1000 },
     timezoneId: TZ_ID,
   });
   await ctx.addCookies(cookies.map(c => ({
@@ -1142,6 +1152,15 @@ async function doRenew(page) {
       // ⇒ 新方案：**一次干净的拖拽直达目标再松手**。
       //   一次提交、答案正确、轨迹带缓动 + 逐步抖动（供震颤分析）。
       {
+        // ★ 拖拽途中题目可能被重发（答错/退避/重摇）⇒ 松手会提交一个
+        //   属于**另一道题**的答案，纯浪费失败预算。记录拖拽前的 capId，提交前复核。
+        const capBefore = st.capId || null;
+        const capNow = await page.evaluate(() => window.__owCapMeta?.id || null);
+        if (capBefore && capNow && capNow !== capBefore) {
+          rounds.push({ stage, kind, note: '拖拽前题目已换，跳过本轮' });
+          log(`  阶段${stage + 1} 拖拽前题目已换（${capBefore} → ${capNow}），跳过`);
+          continue;
+        }
         const v0 = await readVal();
         const boxW = meta.boxW || 300;
         const kInv = boxW / (meta.cm && meta.cm.w ? meta.cm.w : 300);  // Δpx = Δvalue * boxW/meta.w
