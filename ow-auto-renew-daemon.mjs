@@ -1437,6 +1437,12 @@ function ensureResidentialEgress() {
 }
 
 async function once() {
+  // ★ cookie 寿命（天）。由 launch() 之后的诊断块填充，随后随结果返回。
+  //   动机：`sessioncookie`（自研面板会话）只有 7 天寿命，而 Clerk 的 `__session`
+  //   有 360 天。自动化能不能长期跑，取决于**服务端每次访问是否把 sessioncookie
+  //   的过期时间往后推**。这个字段就是回答该问题的观测点。
+  let cookieLeftDays = null;
+
   // ★★★ 2026-10-06：**住宅出口前置** —— 这是让续期真正成功的关键一步。
   //
   // 实测（run 37438598628，GitHub Actions）：
@@ -1462,6 +1468,39 @@ async function once() {
   }
 
   let { browser, page } = await launch();
+
+  // ★★★ cookie 寿命诊断（2026-10-06 新增）。
+  //
+  // 动机：本机 ow_cookies.json（10-03 导出）里各 cookie 的寿命差异极大：
+  //   __session        len=810  到期 2027-10-02（360 天）  ← Clerk 认证，长寿
+  //   __client_uat     len=10   到期 2027-11-06（395 天）
+  //   sessioncookie    len=86   到期 2026-10-09（ 7 天！） ← 自研面板会话，短寿
+  // 而「到期前 120h 才续期」的阈值意味着**首个真正续期的窗口在 10-09 之后**，
+  // 与 sessioncookie 的到期日撞车。所以必须先回答：
+  //   每次打开面板，服务端会不会把 sessioncookie 的 expires 往后推？
+  //   · 会   ⇒ 只要定期把新 cookie 回写（或至少告警），自动化可长期跑
+  //   · 不会 ⇒ 10-09 之后所有运行都会 COOKIE_EXPIRED，必须重新导出
+  // 只打印 name/长度/过期时间，**绝不打印 value**（凭据不入日志）。
+  try {
+    const cks = await page.context().cookies();
+    const fmt = (c) => {
+      if (!(c.expires > 0)) return `${c.name}(len=${String(c.value || '').length},SESSION)`;
+      const exp = new Date(c.expires * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+      const left = ((c.expires * 1000 - Date.now()) / 86400000).toFixed(2);
+      return `${c.name}(len=${String(c.value || '').length},exp=${exp},left=${left}d)`;
+    };
+    log('cookie 现状:', cks.map(fmt).join('  '));
+    const sc = cks.find((c) => c.name === 'sessioncookie') || cks.find((c) => c.name === '__session');
+    if (sc && sc.expires > 0) {
+      cookieLeftDays = +((sc.expires * 1000 - Date.now()) / 86400000).toFixed(2);
+      if (cookieLeftDays < 1.5) {
+        log(`⛔ ${sc.name} 仅剩 ${cookieLeftDays} 天 —— 需尽快重新导出 ow_cookies.json 并更新 OW_COOKIES_B64`);
+      } else {
+        log(`  面板会话 cookie（${sc.name}）剩余 ${cookieLeftDays} 天`);
+      }
+    }
+  } catch (e) { log('cookie 诊断失败（不影响主流程）:', e.message); }
+
   try {
     await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(4000);
@@ -1497,7 +1536,7 @@ async function once() {
     //   force 模式传 9999，max 后仍是 9999，语义不变。
     const THRESHOLD_H = Math.max(120, Number(process.env.OW_THRESHOLD_H || 120));
     if (hl !== null && hl > THRESHOLD_H) {
-      return { ok: true, skipped: true, hoursLeft: hl, renews: info.renews,
+      return { ok: true, skipped: true, hoursLeft: hl, renews: info.renews, cookieLeftDays,
                note: `距到期 ${hl.toFixed(1)}h > 阈值 ${THRESHOLD_H}h，本轮不续` };
     }
 
@@ -1562,7 +1601,7 @@ async function once() {
 
     }
     const after = await readRenew(page);
-    return { ...r, hoursLeft: hl, renewsBefore: info.renews, after };
+    return { ...r, hoursLeft: hl, renewsBefore: info.renews, after, cookieLeftDays };
   } finally {
     await browser.close();
   }
