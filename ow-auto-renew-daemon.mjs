@@ -32,6 +32,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { decodePng, decodePngFromB64, decodePngBuffer, solveOdd, solveGap, solveMatch, solveRotate, solveRotate2 } from './ow-solver-js.mjs';
+import { solveGap2 } from './ow-gap2.mjs';
 import { notify, formatResult } from './ow-telegram.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1044,22 +1045,43 @@ async function doRenew(page) {
       } else {
         // 拼块宽度必须从 DOM 的 chip style.width 读（puzzle=32% / key=24%，不能猜）
         const pw = Math.round((meta.chipWPct / 100) * 300);
-        // ★ meta.px / meta.py 从页面里读（solveGap 依赖 py 限定 y 搜索范围，
-        //   硬编码 px:4 会把搜索起点推到 110，直接漏掉左半张图的答案）。
         const cm = await page.evaluate(() => window.__owCapMeta || null);
-        const sol = solveGap(img, { w: 300, h: 160, vmax: meta.vmax, pw, ph: pw,
-                                    px: cm?.px, py: cm?.py });
-        // 诊断字段透传（solveGap 已在返回里带上）
+        // ★★ 2026-10-06 重写（这是 puzzle 首猜命中率只有 ~9% 的真根因）：
+        //    旧 solveGap 直接令 value = 缺口暗块左缘，
+        //    **漏掉了「chip 图内片块的左偏移」**（实测 6 / 20 / 21 px 等多种）。
+        //    chip.style.left = value 指的是 **chip 整张图**的左缘，
+        //    而片块在 96x96 的 chip 图里并不贴边 ⇒ 必须减掉该偏移。
+        //      正确式：value = 缺口暗块左缘 - chip 图内片块左缘
+        //    证据：3 个 WS 原始样本上，bbox 对齐法与 IoU 形状对齐法**逐样本给出同一个值**
+        //      p01 103/103 (IoU .83)  p02 174/174 (.49)  p03 202/202 (.85)
+        //    真机复验：value=197 ⇒ STAGE 1/4 直接推进到 STAGE 2/4。
+        //    另：缺口内片块内容已被抹掉（NCC 实测 0.22~0.34 无峰）⇒ 模板匹配无解，
+        //        只能用「暗异常 blob + 尺寸自校验」定位。
+        let sol = { i: null, why: 'no-chip-frame' };
+        const chipPng2 = await grabChipPng(page);
+        if (chipPng2) {
+          try {
+            if (grabTooSmall(chipPng2, 'chip')) {
+              sol = { i: null, why: 'chip-empty' };
+            } else {
+              const chipImg = decodePngFromB64(chipPng2);
+              sol = solveGap2(img, chipImg, {
+                w: 300, h: 160, vmax: meta.vmax, pw, ph: pw, py: cm?.py,
+              });
+            }
+          } catch (e) {
+            sol = { i: null, why: 'chip-decode:' + String(e.message).slice(0, 40) };
+          }
+        }
         if (sol.i === null) {
           // ★ 这里原来自己实现了一套坐标点击，绕过了 switchKind 的
           //   三级回退（DOM click / locator.click / 坐标）与失败计数，
           //   结果「缺口未定位」时空转 40 阶段（实测 119 次 puzzle 全耗在这）。
           //   ⇒ 统一走 switchKind，止损交给 switchFails。
-          // 带上 solveGap 的诊断字段（usedPy/py/probes/pwPx），一眼看出是没图还是没对上
           rounds.push({ stage, kind, skipped: 'no-gap-located', grabVia, grabBytes,
-                        diag: sol.diag || null });
+                        diag: { why: sol.why, piece: sol.piece || null, cands: sol.cands } });
           log(`  阶段${stage + 1} ${kind} 缺口未定位（via=${grabVia}, ${grabBytes}B, ` +
-              `usedPy=${sol.usedPy}, py=${sol.py}, pwPx=${sol.pwPx}, probes=${JSON.stringify(sol.probes)}），换题`);
+              `why=${sol.why}, piece=${JSON.stringify(sol.piece || null)}, cands=${sol.cands}），换题`);
           const swOk = await switchKind(page);
           if (swOk) switchFails = 0;
           else if (++switchFails > 1) {
@@ -1069,6 +1091,8 @@ async function doRenew(page) {
           continue;
         }
         target = sol.i;
+        log(`  阶段${stage + 1} ${kind}(gap2) 缺口左缘=${sol.gap?.x0} 片块左缘=${sol.piece?.x0} ` +
+            `⇒ value=${sol.i} (IoU=${sol.iou ?? '-'}, r=${sol.r} t=${sol.t} cands=${sol.cands})`);
       }
 
       // 当前 value 读数（aria-valuenow）
