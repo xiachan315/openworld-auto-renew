@@ -309,6 +309,73 @@ async function moveHuman(page, x, y) {
   await page.waitForTimeout(140);
 }
 
+/**
+ * 在页面里装 WS 探针（2026-10-06 新增，解决"消息到底发出去没有"的取证盲区）。
+ *  · `window.__owSentLog`：记录**实际发出**的 ws 文本消息
+ *  · `window.__owQuiet = true` 时拦下 `ans:` / `tr:`
+ *    ⇒ 可以安全地反复试拖拽而不消耗服务端失败预算
+ * 幂等（`window.__owTap`）；页面重载后需重新调用，故调用方在每次拖拽前调一次。
+ */
+async function owInstallTap(page) {
+  try {
+    await page.evaluate(() => {
+      if (window.__owTap) return;
+      window.__owTap = true;
+      window.__owSentLog = [];
+      const orig = WebSocket.prototype.send;
+      WebSocket.prototype.send = function (d) {
+        try {
+          if (typeof d === 'string') {
+            window.__owSentLog.push(d.slice(0, 80));
+            if (window.__owSentLog.length > 80) window.__owSentLog.shift();
+          }
+        } catch (e) { /* ignore */ }
+        if (window.__owQuiet && typeof d === 'string' &&
+            (d.indexOf('ans:') === 0 || d.indexOf('tr:') === 0)) return undefined;
+        return orig.apply(this, arguments);
+      };
+    });
+  } catch (e) { /* 页面未就绪时忽略 */ }
+}
+
+/**
+ * 拖拽 chip：从它**当前**中心按下，水平移动 dx 像素后抬起。
+ * 协议（源码 467~481 / 557~562 行）：
+ *   pointerdown ⇒ drag = { sx: e.clientX, v0: value }
+ *   pointermove ⇒ apply(drag.v0 + (e.clientX - drag.sx) * (meta.w / boxW))
+ *   window pointerup ⇒ `if (blocked || !drag) return; ... submitSolution();`
+ * ⚠️ **调用本函数会提交一次答案** ⇒ 只能配合 `__owQuiet` 静默期使用。
+ */
+async function dragBy(page, dx, steps) {
+  const c = await page.evaluate(() => {
+    const el = document.getElementById('captcha_chip_default');
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+  });
+  if (!c) return null;
+  const n = steps || 22;
+  // 从稍远处移入（真实鼠标不会凭空出现在 chip 上）
+  await page.mouse.move(c.x - 55, c.y - 25);
+  await page.waitForTimeout(60);
+  await page.mouse.move(c.x, c.y);
+  await page.waitForTimeout(45);
+  await page.mouse.down();
+  await page.waitForTimeout(35);
+  for (let k = 1; k <= n; k++) {
+    const t = k / n;
+    const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+    const noise = (Math.random() - 0.5) * (2.0 * (1 - t) + 0.4);
+    await page.mouse.move(c.x + dx * e + noise, c.y + (Math.random() - 0.5) * 2.0);
+    await page.waitForTimeout(12 + Math.random() * 18);
+  }
+  await page.mouse.move(c.x + dx, c.y);
+  await page.waitForTimeout(35);
+  await page.mouse.up();
+  await page.waitForTimeout(150);
+  return { x0: c.x, dx };
+}
+
 /** 取 chip（拼块）自己的 PNG —— rotate 题判定朝向要用 */
 async function grabChipPng(page) {
   // ★★★ 2026-10-05 实测修掉的两个真 bug（rotate 题型连续 20 次 not a PNG）：
@@ -811,6 +878,10 @@ async function doRenew(page) {
   let oddBF = null;
   let matchBF = null;
   let lastPuzzle = null;
+  // WS 探针辅助：连续「提交了但服务器完全没收到 ans:」的计数。
+  // 源码 433 行 submitSolution() 首行 `if (blocked||verified||!meta||!ws||readyState!==OPEN) return;`
+  // ⇒ 静默 return 时页面**不发任何消息**。用 __owSentLog 判别，比猜可靠。
+  let owNoAnsStreak = 0;
   // ★ 时间预算：换题路径会消耗大量阶段（60 阶段 × 换题等待 ≈ 25 分钟，
   //   会撞 Actions 的 job timeout）。必须自己限时，到点就带着已有进度返回。
   //   24 不够（换题也占阶段），但也不能无限换。
@@ -1095,292 +1166,138 @@ async function doRenew(page) {
             `⇒ value=${sol.i} (IoU=${sol.iou ?? '-'}, r=${sol.r} t=${sol.t} cands=${sol.cands})`);
       }
 
-      // 当前 value 读数（aria-valuenow）
+      // =====================================================================
+      // 2026-10-06 重构：**闭环自校准拖拽 + 单次提交**（替换原开环拖拽 + 键盘 + 滑轨）
+      //
+      // 旧实现的三处硬伤（均有源码/真机证据，不是猜测）：
+      //
+      //  ① 【源码级确证】`trackTo()` / `trackNudge()` **每调用一次就提交一次**。
+      //     源码 447~454 行：track.pointerdown ⇒ `drag = "track"; trackToValue(e)`
+      //     源码 557~562 行：window pointerup ⇒
+      //        `if (blocked || !drag) return; stopJitter(); drag = null;
+      //         if (meta) { rec(); submitSolution(); }`
+      //     ⇒ **track 的 down+up 必然 submitSolution()**（旧注释「点 track 只 apply
+      //       不 submit」是错的）。
+      //     旧「二分收缩 8 次 + 邻域扫描 12 次」最多灌 20 个**错误答案**进服务端，
+      //     直接触发源码 238 行的 `burned`（失败预算清零重开）。
+      //
+      //  ② 拖拽是**开环**的：`dxTotal = (target - v0) * boxW/meta.w`。
+      //     协议实测（drag1.json，数值精确吻合）：
+      //       v0=120，鼠标 1116.37 → 1067.5（Δ = -48.87）⇒ aria-valuenow = 71。
+      //       即 `value = v0 + ΔclientX * meta.w / boxW`。
+      //     但 `meta.boxW` 是在**布局稳定之前**抓的 ⇒ 比例系数偏大：
+      //       日志 `value=197 chip→128`，而 197 × 300/462 ≈ 127.9。**完全对上**。
+      //
+      //  ③ 没有「消息到底发出去没有」的证据 ⇒ 每次排查只能猜。
+      //
+      // 新方案：
+      //  · **WS 探针**：patch `WebSocket.prototype.send`，把实际发出的消息记进
+      //    `window.__owSentLog`；并支持 `window.__owQuiet` 静默 `ans:` / `tr:`。
+      //    ⇒ 解决 ③，同时给 ② 提供安全的试错空间（静默期不发任何消息）。
+      //  · **静默闭环校准**：拖动 → 读 aria-valuenow → 用 ΔclientX / Δvalue 反推
+      //    真实比例系数 k，迭代收敛到 target。
+      //  · **单次提交**：解除静默后一次 down+up（pointerup ⇒ submitSolution），
+      //    然后读 `__owSentLog` 确认 `ans:` 真的发出去了。
+      // =====================================================================
+      await owInstallTap(page);
+
       const readVal = () => page.evaluate(() =>
         Number(document.getElementById('captcha_chip_default')?.getAttribute('aria-valuenow') || 0));
 
-      // ---- 滑轨精调（键盘未命中时兜底）。定义在分支外，键盘/拖拽两条路径共用 ----
+      const chipCenter = () => page.evaluate(() => {
+        const c = document.getElementById('captcha_chip_default');
+        if (!c) return null;
+        const r = c.getBoundingClientRect();
+        return { x: r.x + r.width / 2, y: r.y + r.height / 2, w: r.width };
+      });
+
+      const sentTail = (n) => page.evaluate((k) => (window.__owSentLog || []).slice(-k), n || 6);
+      const setQuiet = (q) => page.evaluate((v) => { window.__owQuiet = v; }, q);
+
       const vmax = meta.vmax || 204;
-      const handleW = meta.handleW || 24;
-      const span = Math.max(1, (meta.trackW || 0) - handleW);
-      // 协议 trackToValue：
-      //   frac = clamp((clientX - trackLeft - handleW/2) / (trackW - handleW), 0, 1)
-      //   value = round(frac * vmax)
-      const trackTo = async (want) => {
-        const f = Math.max(0, Math.min(1, want / vmax));
-        const x = meta.trackX + handleW / 2 + f * span;
-        await moveHuman(page, x, meta.trackCy);
-        await page.mouse.down();
-        await page.waitForTimeout(80);
-        await page.mouse.up();
-        await page.waitForTimeout(450);
-      };
-      const trackNudge = async (want) => {
-        // 精确逼近：每次按误差收缩，最多 10 次
-        let v = await readVal();
-        for (let i = 0; i < 10 && Math.abs(v - want) > 1; i++) {
-          await trackTo(want);
-          const nv = await readVal();
-          if (nv === v) break;          // 滑轨不动了（多半是 handleW/trackW 读错）
-          v = nv;
-        }
-        return v;
-      };
+      target = Math.max(0, Math.min(vmax, target));
 
-      // ---- 交互策略：先粗拖（产生真实 pointer 轨迹喂行为门），再键盘精调，最后 Enter 提交 ----
-      // 协议关键（读前端源码确认）：
-      //   · chip 的 pointerdown/move 只改 value；**pointerup 才 submitSolution**
-      //   · 键盘 ArrowLeft/Right 调 value（步进 2；Shift = vmax/18 粗调），Enter 提交
-      //   · ⚠️ 键盘事件绑在 chip 上，**必须让 chip 真正获得焦点**。
-      //     只调 el.focus() 不够（headless 下 tabindex=0 的元素不一定接受键盘），
-      //     实测 141 次方向键全无效 —— 必须用真实 mouse.click 点一下 chip。
-      //   · 之前另一个失败原因：拖到一半 pointerup 就提交，后续调整没再提交
-      await moveHuman(page, meta.chipCx, meta.chipCy);
-      await page.mouse.click(meta.chipCx, meta.chipCy);   // 真实点击 → 聚焦
-      await page.waitForTimeout(300);
-      const focused = await page.evaluate(() => document.activeElement?.id || '');
-      if (focused !== 'captcha_chip_default') {
-        // 兜底：直接 focus()，并在读数前验证键盘是否生效
-        await page.evaluate(() => document.getElementById('captcha_chip_default')?.focus());
-        await page.waitForTimeout(200);
-      }
-
-      // ★★★ 2026-10-06 按**页面真实源码**重写提交路径（Tabbit 实测 + 读 page-src.js 得出）。
-      //
-      // 源码事实（`captcha` 内联脚本）：
-      //   chip.addEventListener("pointermove", e =>
-      //       apply(drag.v0 + (e.clientX - drag.sx) * (meta.w / boxW)));
-      //   window.addEventListener("pointerup", function () {
-      //       if (blocked || !drag) return; stopJitter(); drag = null;
-      //       if (meta) { rec(); submitSolution(); } });        // ← 松手**无条件**提交
-      //   submitSolution(){ if (blocked||verified||!meta||!ws||ws.readyState!==OPEN) return;
-      //       if (samples.length) ws.send("tr:" + ...); ws.send("ans:" + Math.round(value)); }
-      //
-      // 由此确认旧实现的 3 个错（都不是猜测，是可复现的行为差异）：
-      //
-      // ① **拖拽目标错半个 chip 宽**。协议是 `Δvalue = ΔclientX * meta.w / boxW`，
-      //    鼠标抓的是 chip **中心**；而旧代码把鼠标移到 `boxX + target/300*boxW`
-      //    —— 那是 chip **左缘**该到的位置。
-      //    Tabbit 实测：瞄 119，实际 `aria-valuenow` = 71 = 119 - 48（chip 宽 96 的一半）。
-      //    正确终点 = `chipCx + (target - v0) * boxW / meta.w`。
-      //
-      // ② **"拖回原位再松手"必然先提交一个错答案**。
-      //    旧注释以为"松手提交的 value 与初始一致，不会误判"——恰恰相反：
-      //    pointerup 是**无条件**提交Solution 的，于是这一发必定是错的，
-      //    白白消耗服务端的失败预算（实测约 3 次错就 `burned` 重开）。
-      //
-      // ③ **trackTo 是单点跳变，没有震颤轨迹**。
-      //    `rec()` 记 `[相对毫秒, value]`，上限 200 个，服务端做 tremor analysis。
-      //    旧 trackTo = 一次 move + down + up ⇒ 只有 2 个采样点 ⇒ 机器特征明显。
-      //
-      // ⇒ 新方案：**一次干净的拖拽直达目标再松手**。
-      //   一次提交、答案正确、轨迹带缓动 + 逐步抖动（供震颤分析）。
-      {
-        // ★ 拖拽途中题目可能被重发（答错/退避/重摇）⇒ 松手会提交一个
-        //   属于**另一道题**的答案，纯浪费失败预算。记录拖拽前的 capId，提交前复核。
-        const capBefore = st.capId || null;
-        const capNow = await page.evaluate(() => window.__owCapMeta?.id || null);
-        if (capBefore && capNow && capNow !== capBefore) {
-          rounds.push({ stage, kind, note: '拖拽前题目已换，跳过本轮' });
-          log(`  阶段${stage + 1} 拖拽前题目已换（${capBefore} → ${capNow}），跳过`);
+      // ---- 同图同答案去重（避免把同一个错误答案反复重打）----
+      // 判据必须带 capId：rotate 答案恒为 0，只用 kind+target 会把**每张新图**
+      // 都误判成重复（实测 10 次 rotate 里 7 次是假重复）。rotate 允许同图重试 1 次。
+      const sig = `${kind}:${st.capId || 'na'}:${target}`;
+      if (lastPuzzle === sig) {
+        rotateSameFig = kind === 'rotate' ? (rotateSameFig || 0) + 1 : 0;
+        if (!(kind === 'rotate' && rotateSameFig <= 1)) {
+          rounds.push({ stage, kind, value: target, note: '定位重复，换题',
+                        sameFigRetry: rotateSameFig });
+          log(`  阶段${stage + 1} ${kind} 定位重复（第 ${rotateSameFig} 次），换题`);
+          const swOk = await switchKind(page);
+          if (swOk) switchFails = 0;
+          else if (++switchFails > 1) {
+            return { ok: false, why: 'SWITCH_DEAD', rounds,
+                     note: '换题按钮连续无效，重开会话重摇题型' };
+          }
           continue;
         }
-        const v0 = await readVal();
-        const boxW = meta.boxW || 300;
-        const kInv = boxW / (meta.cm && meta.cm.w ? meta.cm.w : 300);  // Δpx = Δvalue * boxW/meta.w
-        const dxTotal = (target - v0) * kInv;
-        const STEPS = 26;
-        // 缓动（ease-in-out cubic）+ 逐 step 微抖动 + 末端回稳，逼近真人轨迹
-        await page.mouse.move(meta.chipCx, meta.chipCy);
-        await page.mouse.down();
-        await page.waitForTimeout(40 + Math.random() * 40);
-        for (let k = 1; k <= STEPS; k++) {
-          const t = k / STEPS;
-          const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-          const noise = (Math.random() - 0.5) * (2.4 * (1 - t) + 0.5);
-          await page.mouse.move(
-            meta.chipCx + dxTotal * e + noise,
-            meta.chipCy + (Math.random() - 0.5) * 2.2,
-          );
-          await page.waitForTimeout(14 + Math.random() * 22);
-        }
-        // 末端轻修正回精确值（噪声可能带来 1~2px 偏差）
-        for (let g = 0; g < 6; g++) {
-          const cur = await readVal();
-          if (Math.abs(cur - target) <= 1) break;
-          const back = (target - cur) * kInv;
-          for (let k = 1; k <= 5; k++) {
-            await page.mouse.move(
-              meta.chipCx + dxTotal + back * (k / 5),
-              meta.chipCy + (Math.random() - 0.5) * 1.2,
-            );
-            await page.waitForTimeout(16);
-          }
-        }
-        await page.mouse.up();          // ← 这一发就是正确答案
-        await page.waitForTimeout(1400);
-      }
-
-      // 2) 键盘精确逼近。先验证一次按键是否真的改变 value（防焦点陷阱）
-      let cur = await readVal();
-      const probe0 = cur;
-      await page.keyboard.press('ArrowRight');
-      await page.waitForTimeout(150);
-      const probe1 = await readVal();
-      const keyboardWorks = probe1 !== probe0;
-      if (!keyboardWorks) {
-        // 滑轨定位（协议 trackToValue）：
-        //   frac = clamp((clientX - trackLeft - handleW/2) / (trackW - handleW), 0, 1)
-        //   apply(frac * vmax)
-        // ⚠️ 之前失败的原因：点 track 只 apply 不 submit，随后点 chip 提交时
-        //    value 已被下一步的 apply 改偏了。⇒ 改成「只在 track 上迭代逼近，
-        //    精确命中后再点 chip 提交」。
-        // trackTo / span / handleW / vmax 已提升到本分支外（键盘路径也要用）
-        cur = await readVal();
-        // 二分收缩：每次按当前误差方向重定位，最多 8 次
-        for (let g2 = 0; g2 < 8 && Math.abs(cur - target) > 1; g2++) {
-          const err = target - cur;
-          await trackTo(cur + err);          // 按误差比例直接跳
-          cur = await readVal();
-        }
-        // ★★ 修正（2026-10-05 run#11）：判据必须**包含 meta.id**。
-        //   原来只用 `kind:target`，而 rotate 的答案**恒为 0**（chip 是绿色圆球，
-        //   缺口恒在正上方 ⇒ 转 0° 就对；实测 solveRotate2 返回 iou=0.337 找对了），
-        //   于是**每张新图都被判"重复"** ⇒ rotate 出现 10 次、7 次是假重复。
-        //   ⇒ 用 `kind:meta.id:target`：只有**同一张图**算出同一答案才算重复。
-        const sig = `${kind}:${st.capId || 'na'}:${target}`;
-        if (lastPuzzle === sig) {
-          // ★ rotate 只允许同一张图重试 1 次。
-          //   实测：rotate 的 chip 已经叠在缺口上，value=0 通常就是正确答案
-          //   （成功那次 owrun7：`rotate value=0 chip→0 STAGE 2/6` —— stage 推进了）。
-          //   若这次仍不推进，说明该题缺口方向不是 0°，而主轴法 aniso=0.027 算不出角度
-          //   ⇒ 立刻换题，别纠缠（owrun14 里 rotate 吃了 16 阶段耗尽预算 → KEY_STUCK）。
-          // ★★ 真 bug（2026-10-06 run#25 抓到）：原写法
-          //     `const sameFigRetry = (rotateSameFig = rotateSameFig || 0) + 1;`
-          //   括号位置错了 —— 赋值表达式 `(rotateSameFig = rotateSameFig || 0)`
-          //   的值恒等于当前值（0），**rotateSameFig 永远不自增** ⇒ sameFigRetry 恒为 1
-          //   ⇒ 恒 `<= ROTATE_MAX_RETRY(1)` ⇒ **换题分支永远进不去**。
-          //   run#25 日志直接印证：阶段10~40 连续 30 个阶段全是
-          //   `rotate 同图再试 1 次（若仍不行就换题）`，**一次都没真换过题**，
-          //   整场 8 分钟烧在同一道题上，最后 NOT_READY 收场。
-          //   正确写法：先自增，再取值。
-          rotateSameFig = (rotateSameFig || 0) + 1;
-          const sameFigRetry = rotateSameFig;
-          const ROTATE_MAX_RETRY = 1;
-          if (!(kind === 'rotate' && sameFigRetry <= ROTATE_MAX_RETRY)) {
-            rounds.push({ stage, kind, value: target, note: '定位重复，换题',
-                          sameFigRetry });
-            log(`  阶段${stage + 1} ${kind} 定位重复（第 ${sameFigRetry} 次），换题`);
-            const swOk = await switchKind(page);
-            if (swOk) switchFails = 0;
-            else if (++switchFails > 1) {
-              return { ok: false, why: 'SWITCH_DEAD', rounds,
-                       note: '换题按钮连续无效，重开会话重摇题型' };
-            }
-            rotateSameFig = 0;
-            continue;
-        } else {
-          // ★ rotate 只重试 1 次就换题。
-          //   实测（2026-10-05）：rotate 的 chip 已经叠在缺口上，**value=0 就是正确答案**
-          //   （成功那次 owrun7：`rotate value=0 chip→0 STAGE 2/6` —— stage 推进了）。
-          //   若提交后 stage 没前进，说明该题缺口方向不是 0°，而我的主轴法实测
-          //   aniso=0.027（台灯太短胖）根本算不出角度。
-          //   ⇒ **不要在同一张图上纠缠**：owrun14 里 rotate 吃了 16 个阶段、
-          //     耗尽换题预算直接导致 KEY_STUCK。一次不行立刻换题。
-          log(`  阶段${stage + 1} rotate 同图再试 1 次（若仍不行就换题）`);
-        }
-        } else {
-          rotateSameFig = 0;
-        }
-        lastPuzzle = sig;
-
-        // 命中后提交：点 chip 触发 pointerup -> submitSolution
-        // （chip 已被 trackTo 移动 ⇒ 用实时坐标，不用 meta.chipCx）
-        const posNow = await page.evaluate(() => {
-          const c = document.getElementById('captcha_chip_default');
-          const r = c.getBoundingClientRect();
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-        });
-        await moveHuman(page, posNow.x, posNow.y);
-        await page.mouse.click(posNow.x, posNow.y);
-        await page.waitForTimeout(1400);
-        let stNow = await readState(page);
-        const beforeStage = stNow.stage;
-        // 兜底：若没推进（暗块/朝向判定有偏差），在目标附近做小范围扫描
-        if (stNow.tokenLen === 0) {
-          const span = kind === 'rotate' ? 20 : 12;
-          const step = kind === 'rotate' ? 10 : 4;
-          for (let d = step; d <= span; d += step) {
-            for (const sgn of [1, -1]) {
-              await trackTo(Math.max(0, Math.min(vmax, target + sgn * d)));
-              // ⚠️ chip 已随 value 移动 ⇒ 必须重新读它的当前位置再点
-              const nb = await page.evaluate(() => {
-                const c = document.getElementById('captcha_chip_default');
-                const r = c.getBoundingClientRect();
-                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
-              });
-              await moveHuman(page, nb.x, nb.y);
-              await page.mouse.click(nb.x, nb.y);
-              await page.waitForTimeout(1300);
-              stNow = await readState(page);
-              // ⚠️ 不用 stage 判成功（答错后服务端会重发同 stage 新题，stage 会倒退）
-              if (stNow.tokenLen > 0) break;
-            }
-            if (stNow.tokenLen > 0) break;
-          }
-          // 扫描失败后把 chip 停回最优解，避免下一阶段起点错位
-          await trackTo(target);
-          cur = await readVal();
-        }
-        rounds.push({ stage, kind, value: target, vmax: meta.vmax, via: 'track+scan',
-                      chipNow: cur, stageAfter: stNow.stage, tokenLen: stNow.tokenLen,
-                      grabVia, grabBytes, capId: st.capId });
-        log(`  阶段${stage + 1} ${kind} value=${target} chip→${cur} ${stNow.stage}` +
-            (stNow.tokenLen > 0 ? ' ★token' : ''));
+        log(`  阶段${stage + 1} rotate 同图重试 1 次`);
       } else {
-        // ⚠️ 实测 bug：ArrowLeft/Right **步进是 2**（不是 1）。
-        //   旧循环条件 `|cur-target|>1` 在奇偶差时会死循环到 guard 耗尽仍差 1，
-        //   然后拿错值提交 ⇒ 日志里大量 "目标 179 chip→83"。
-        // 修法：① 用 Shift 做粗调（协议：Shift = vmax/18）；② 收敛判据放宽到 ±2；
-        //      ③ 退出后**必须校验**，偏差 >2 就改走 trackTo（滑轨）精确逼近。
-        const STEP = 2;
-        let guard = 0;
-        while (Math.abs(cur - target) > STEP && guard < 40) {
-          const err = target - cur;
-          if (Math.abs(err) > 20) {
-            // 大偏差：Shift 粗调（一次 vmax/18）
-            await page.keyboard.press(err > 0 ? 'Shift+ArrowRight' : 'Shift+ArrowLeft');
-          } else {
-            await page.keyboard.press(err > 0 ? 'ArrowRight' : 'ArrowLeft');
-          }
-          if (guard % 6 === 0) await page.waitForTimeout(120);
-          cur = await readVal();
-          guard++;
+        rotateSameFig = 0;
+      }
+      lastPuzzle = sig;
+
+      // ---- 闭环自校准拖拽（静默期：发出的一切 ans:/tr: 都被 __owQuiet 拦下）----
+      // kEst = 每 1 单位 value 需要移动多少 clientX 像素（px/value）。
+      // 源码 478 行：`k = meta.kind === "rotate" ? meta.vmax / boxW : meta.w / boxW`
+      //   ⇒ rotate 用 vmax，其余用 meta.w。
+      let kEst = (kind === 'rotate')
+        ? (meta.boxW && meta.vmax ? meta.boxW / meta.vmax : 1)
+        : ((meta.boxW && meta.cm && meta.cm.w) ? meta.boxW / meta.cm.w : 1);
+      if (!(kEst > 0.3 && kEst < 6)) kEst = 1;   // 布局未稳时 boxW 不可信，退回 1:1
+
+      await setQuiet(true);
+      let v = await readVal();
+      const trace = [];
+      for (let it = 0; it < 7; it++) {
+        const err = target - v;
+        if (Math.abs(err) < 1) break;   // 收敛到「取整后就是 target」
+        const dx = err * kEst;
+        await dragBy(page, dx);
+        const v2 = await readVal();
+        trace.push({ v0: v, dx: Math.round(dx), v1: v2, k: +kEst.toFixed(3) });
+        if (dx !== 0 && v2 !== v) {
+          const kNew = dx / (v2 - v);            // px / value
+          if (kNew > 0.3 && kNew < 6) kEst = kNew;
         }
-        // 键盘没能精确命中（奇偶差 / 焦点丢失）⇒ 记录并交给下面的滑轨兜底
-        const kbErr = Math.abs(cur - target);
-        rounds.push({ stage, kind, value: target, vmax: meta.vmax, chipNow: cur,
-                      iters: guard, kbErr, via: 'keyboard' });
-        if (kbErr > 2) {
-          log(`  阶段${stage + 1} ${kind} 键盘未精确命中（差 ${kbErr}），走滑轨`);
-        } else {
-          await page.keyboard.press('Enter');
-          await page.waitForTimeout(1500);
-          log(`  阶段${stage + 1} ${kind} 目标 value=${target} chip→${cur} (${guard} 次) ★已提交`);
-          cur = await readVal();
-          if (cur === target) { /* 提交成功，继续下一阶段 */ }
-        }
-        // 键盘未精确命中 ⇒ 走滑轨精确逼近后再提交（否则拿错值提交，必错）
-        if (Math.abs(cur - target) > 2) {
-          const fixed = await trackNudge(target);
-          rounds.push({ stage, kind, note: 'keyboard-miss->track', from: cur, to: fixed, target });
-          log(`  阶段${stage + 1} ${kind} 滑轨兜底 ${cur} → ${fixed}（目标 ${target}）`);
-          cur = fixed;
-          if (Math.abs(cur - target) <= 2) {
-            await page.keyboard.press('Enter');
-            await page.waitForTimeout(1500);
-            log(`  阶段${stage + 1} ${kind} 滑轨命中 ${cur} ★已提交`);
-          }
+        v = v2;
+      }
+      await setQuiet(false);
+
+      // ---- 单次提交：click chip ⇒ pointerdown(drag=..) + pointerup ⇒ submitSolution ----
+      const cc = await chipCenter();
+      if (!cc) {
+        rounds.push({ stage, kind, note: 'NO_CHIP_ELEMENT' });
+        return { ok: false, why: 'NO_CHIP', rounds };
+      }
+      await moveHuman(page, cc.x, cc.y);
+      await page.mouse.click(cc.x, cc.y);
+      await page.waitForTimeout(1600);
+
+      const sent = await sentTail(8);
+      const stNow = await readState(page);
+      const ansSent = sent.filter((s) => s.startsWith('ans:'));
+      const landed = await readVal();
+      rounds.push({ stage, kind, value: target, landed, k: +kEst.toFixed(3), trace,
+                    sent, chipNow: landed, via: 'closedloop',
+                    stageAfter: stNow.stage, tokenLen: stNow.tokenLen, capId: st.capId });
+      log(`  阶段${stage + 1} ${kind} 目标=${target} 落点=${landed} k=${kEst.toFixed(3)} ` +
+          `ans=${JSON.stringify(ansSent)} ${stNow.stage}` + (stNow.tokenLen > 0 ? ' ★token' : ''));
+      log(`    轨迹 ${JSON.stringify(trace)}`);
+      log(`    发出 ${JSON.stringify(sent)}`);
+
+      if (ansSent.length > 0) owNoAnsStreak = 0;
+      else {
+        owNoAnsStreak++;
+        log(`    ⚠️ 提交后页面**一条 ans: 都没发出**（streak=${owNoAnsStreak}）` +
+            ` ⇒ submitSolution() 被首行拦下（blocked / meta 丢失 / WS 非 OPEN）`);
+        if (owNoAnsStreak >= 2) {
+          return { ok: false, why: 'SUBMIT_BLOCKED', rounds,
+                   note: '页面侧 submitSolution() 静默 return：拿不到 ans: 说明被反自动化闸门或 WS 状态拦住' };
         }
       }
 
