@@ -26,6 +26,7 @@
  *   OW_EDGE      Edge/Chrome 可执行文件
  *   OW_THRESHOLD_H  距到期多少小时内才真的续（默认 48）
  *   OW_INTERVAL_H   loop 模式的检查间隔小时数（默认 8）
+ *   OW_JITTER_MAX   启动后随机等待 0~N 分钟再接触目标站（默认 20，0=关闭）
  *   OW_NOTIFY    把每轮结果 JSONL 追加到此文件
  */
 import fs from 'fs';
@@ -1494,6 +1495,34 @@ async function once() {
   else {
     log('住宅出口 =', eg.ip);
     log('  出口归属:', String(eg.info || '').replace(/\s+/g, ' ').slice(0, 180));
+  }
+
+  // ★★★ 2026-10-06：**随机抖动（jitter）** —— 打散「每天同一时刻」的自动化指纹。
+  //
+  // 动机：GitHub 的 `schedule` cron 是雷打不动的固定时刻（本仓库
+  //   `23 8 * * *` = 北京 16:23）。出口 IP 每轮都换（住宅节点随机）已经解决了
+  //   网络维度的规律性，但**时间维度**上「每天同一分钟出现同一种自动化行为」
+  //   仍是一条独立且显眼的指纹。用户明确要求：别每天固定一个时间点。
+  //
+  // 机制：在**第一次接触目标站之前**随机等待 0~OW_JITTER_MAX 分钟（均匀分布）。
+  //   · 放在 launch() 之前 ⇒ 连「打开面板读状态」的时刻都是随机的，
+  //     而不只是续期请求（读面板同样带 cookie、同样算一次目标站访问）。
+  //   · 放在 ensureResidentialEgress() 之后 ⇒ 住宅出口连的是 VPN Gate
+  //     第三方中继，与目标站风控无关，不必把随机预算浪费在它身上。
+  //
+  // 预算：workflow `timeout-minutes: 45`；实测「有续期动作」的 run 6.9 分钟、
+  //   「跳过路径」2.4~2.9 分钟 ⇒ 默认上限 20 分钟，保守留 25 分钟余量。
+  //   想更保守/更激进改 OW_JITTER_MAX 即可，不改代码。
+  //   force 模式（OW_THRESHOLD_H=9999，手动调试）跳过抖动，方便立刻看结果。
+  const isForceRun = process.env.OW_THRESHOLD_H === '9999';
+  const JITTER_MAX_MIN = Math.max(0, Number(process.env.OW_JITTER_MAX ?? 20));
+  if (JITTER_MAX_MIN > 0 && !isForceRun) {
+    const jitterMs = Math.floor(Math.random() * JITTER_MAX_MIN * 60000);
+    log(`⏱ 随机抖动：等待 ${(jitterMs / 60000).toFixed(1)} 分钟`
+        + `（0~${JITTER_MAX_MIN} 分钟均匀随机）—— 打散「固定时刻」指纹`);
+    await new Promise((r) => setTimeout(r, jitterMs));
+  } else if (isForceRun) {
+    log('⏱ 随机抖动：跳过（force 手动调试模式）');
   }
 
   let { browser, page } = await launch();
