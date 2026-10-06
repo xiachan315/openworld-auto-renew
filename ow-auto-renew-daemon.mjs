@@ -1424,7 +1424,7 @@ function ensureResidentialEgress() {
   const readTmp = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch (e) { return ''; } };
   try {
     const out = execSync('bash ow-egress.sh', {
-      cwd: __dirname, encoding: 'utf8', timeout: 480000, maxBuffer: 8 << 20,
+      cwd: __dirname, encoding: 'utf8', timeout: 900000, maxBuffer: 8 << 20,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     const ip = readTmp('/tmp/ow-egress.ip');
