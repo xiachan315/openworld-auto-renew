@@ -734,11 +734,16 @@ async function doRenew(page) {
   let grabBytes = 0;
   let lastMatch = null;
   let lastOdd = null;
+  // 穷举状态：按 meta.id(capId) 记录本题已试过的候选，换题(capId 变化)即重置
+  let oddBF = null;
+  let matchBF = null;
   let lastPuzzle = null;
   // ★ 时间预算：换题路径会消耗大量阶段（60 阶段 × 换题等待 ≈ 25 分钟，
   //   会撞 Actions 的 job timeout）。必须自己限时，到点就带着已有进度返回。
   //   24 不够（换题也占阶段），但也不能无限换。
-  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 15 * 60 * 1000);
+  // ★ 2026-10-06 调大：穷举每个 stage 要试 4~6 个候选，15 分钟不够走完 5~6 个 stage。
+  //   job timeout 是 45 分钟，留足 28 分钟给本轮。
+  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 28 * 60 * 1000);
   const t0 = Date.now();
   for (let stage = 0; stage < 40; stage++) {
     if (Date.now() - t0 > DEADLINE_MS) {
@@ -813,44 +818,26 @@ async function doRenew(page) {
     if (kind === 'odd') {
       const sol = solveOdd(img, GRID, 300, 160);
       if (sol.i === null) return { ok: false, why: 'SOLVER_NULL', rounds };
-      const pt = await page.evaluate(({ lx, ly }) => {
-        const r = document.getElementById('captcha_box_default').getBoundingClientRect();
-        return { x: r.x + (lx / 300) * r.width, y: r.y + (ly / 160) * r.height };
-      }, { lx: GRID[sol.i].x, ly: GRID[sol.i].y });
-      // ★ 关键修复：答案不推进就**换题**，不要在旧图上重试。
-      // 实测（Actions run #3）：odd 答错后脚本自循环 24 次，
-      // 每次 margin 都是 0.9037 完全相同 —— 同一张旧 PNG 算了同一个答案，
-      // 白烧 3 分钟。现在改为：重复判定即换题。
-      if (lastOdd && lastOdd.i === sol.i && Math.abs(lastOdd.margin - sol.margin) < 1e-6) {
-        // 答案重复 ⇒ 换题。**不要在这里放弃**：
-        // 换题机制已证明有效（实测连点 8 次得 8 种题型），放弃是多余的。
-        // 真正的止损点是「整轮 24 个阶段用尽」，那时自然返回失败。
-        rounds.push({ stage, kind, i: sol.i, margin: sol.margin, note: '答案重复，换题' });
-        log(`  阶段${stage + 1} odd 判定重复，换题`);
-        if (!await switchKind(page)) {
-          if (++switchFails > 1) {
-            return { ok: false, why: 'SWITCH_DEAD', rounds,
-                     note: '换题按钮连续无效，重开会话重摇题型' };
-          }
-        } else switchFails = 0;
-        continue;
-      }
-      // ★ 低置信度门槛：**按 regime 分档**，不是一刀切 margin。
-      //   实测统计（owrun7/8 + Actions run#20）：
-      //     regime=color  → margin 0.90 / 1.02   （高置信，可答）
-      //     regime=shape  → margin 0.0009 ~ 0.076 （全是瞎猜，且 0.0087 重复 4 次 = 原地打转）
-      //   ⇒ shape 型低于阈值直接换题，别浪费提交；color 型不设门槛。
-      // ⚠️ 阈值必须**数据驱动**。我先后拍过 0.06 / 0.15 两个值，
-      //   统计全部历史 margin（shape 型）后看到真实分布是：
-      //     0.011 / 0.021 / 0.076 / 0.279 / 0.281
-      //   ⇒ 0.15 落在 0.076 与 0.279 中间，但**没有任何证据**说这里该切。
-      //   现在用 0.05：只拦「几乎并列」（最差那几个），放过 0.076+ 的中档。
-      //   宁可多试一次（换题不要钱），也不要因为过严门槛白耗换题预算。
-      const MIN_MARGIN = Number(process.env.OW_MIN_ODD_MARGIN || 0.05);
-      if (sol.margin !== undefined && sol.margin < MIN_MARGIN) {
-        rounds.push({ stage, kind, i: sol.i, margin: sol.margin,
-                      note: `低置信(${sol.margin}<${MIN_MARGIN})，换题` });
-        log(`  阶段${stage + 1} odd 置信度不足（margin=${sol.margin}），换题`);
+
+      // ★★ 2026-10-06 run#26 后的**策略级改写**：odd 改为**穷举**。
+      //
+      // 证据（run#26）：odd 是唯一能推进 stage 的题型
+      //   （`items[2] margin=0.0964` 和 `items[1] margin=0.9649` 两次都 → STAGE 2/5），
+      //   但求解器首猜命中率只有约 40%（5 次提交 2 次推进）。
+      //   而 old 代码在「算出同一个答案」时做的是 **换题** ——
+      //   白白扔掉一次换题预算，却没试过另外 3 个候选。
+      //
+      // odd 一共只有 4 个候选（meta.items 给了精确圆心），
+      // ⇒ 按求解器排序逐个试，**必然有一个是对的**。
+      // 这才把 odd 从「靠运气」变成「确定性通过」。
+      const cid = st.capId || 'na';
+      if (!oddBF || oddBF.cid !== cid) oddBF = { cid, tried: [] };
+      const rankAll = (sol.rank && sol.rank.length ? sol.rank.slice() : [sol.i]);
+      for (let k = 0; k < GRID.length; k++) if (!rankAll.includes(k)) rankAll.push(k);
+      const pickI = rankAll.find((i) => !oddBF.tried.includes(i));
+      if (pickI === undefined) {
+        rounds.push({ stage, kind, note: 'odd 四候选全试过，换题', tried: oddBF.tried.slice() });
+        log(`  阶段${stage + 1} odd 已试遍 4 个候选，换题`);
         const swOk = await switchKind(page);
         if (swOk) switchFails = 0;
         else if (++switchFails > 1) {
@@ -859,11 +846,29 @@ async function doRenew(page) {
         }
         continue;
       }
+      oddBF.tried.push(pickI);
+      lastOdd = { i: pickI, margin: sol.margin };
+
+      const pt = await page.evaluate(({ lx, ly }) => {
+        const r = document.getElementById('captcha_box_default').getBoundingClientRect();
+        return { x: r.x + (lx / 300) * r.width, y: r.y + (ly / 160) * r.height };
+      }, { lx: GRID[pickI].x, ly: GRID[pickI].y });
+      // ★ 关键修复：答案不推进就**换题**，不要在旧图上重试。
+      // 实测（Actions run #3）：odd 答错后脚本自循环 24 次，
+      // 每次 margin 都是 0.9037 完全相同 —— 同一张旧 PNG 算了同一个答案，
+      // 白烧 3 分钟。现在改为：重复判定即换题。
+      // （旧实现在这里做「答案重复 ⇒ 换题」与「低置信 ⇒ 换题」。
+      //   2026-10-06 已删除：odd 只有 4 个候选，换题是浪费预算，
+      //   正确做法是换**候选**（见上方 oddBF 穷举）。低置信也不再拦：
+      //   margin 小只说明排序不可靠，穷举 4 次照样命中。）
+
       lastOdd = { i: sol.i, margin: sol.margin };
       await moveHuman(page, pt.x, pt.y);
       await page.mouse.click(pt.x, pt.y);
-      rounds.push({ stage, kind, i: sol.i, margin: sol.margin, regime: sol.regime });
-      log(`  阶段${stage + 1} odd 判 items[${sol.i}] margin=${sol.margin} regime=${sol.regime}`);
+      rounds.push({ stage, kind, i: pickI, margin: sol.margin, regime: sol.regime,
+                    bfTry: oddBF.tried.length });
+      log(`  阶段${stage + 1} odd 试 items[${pickI}]（第 ${oddBF.tried.length}/4 候选）` +
+          ` margin=${sol.margin} regime=${sol.regime}`);
     } else if (kind === 'puzzle' || kind === 'key' || kind === 'rotate') {
       // 协议要点（读前端源码确认）：
       //   · 答案 = Math.round(value)，value 即 chip 左边缘的**逻辑 x 坐标**
@@ -1238,22 +1243,22 @@ async function doRenew(page) {
         right: [58, 80, 118].map(y => ({ x: 242, y, r: 28 })) };
       const sol = solveMatch(img, MMETA);
       if (!sol.pairs.length) return { ok: false, why: 'MATCH_FAIL', rounds };
-      const box = await page.locator('#captcha_box_default').boundingBox();
-      const toPx = (lx, ly) => ({ x: box.x + (lx / 300) * box.width, y: box.y + (ly / 160) * box.height });
-      for (const [li, ri] of sol.pairs) {
-        const a = toPx(58, MMETA.left[li].y);
-        await moveHuman(page, a.x, a.y); await page.mouse.click(a.x, a.y);
-        await page.waitForTimeout(500);
-        const bpt = toPx(242, MMETA.right[ri].y);
-        await moveHuman(page, bpt.x, bpt.y); await page.mouse.click(bpt.x, bpt.y);
-        await page.waitForTimeout(500);
-      }
-      // ★ 答错就在原地重复（实测 run#14：match 同一配对重复 17 次）。
-      //   判据：同一 meta.id 下算出同一个配对 ⇒ 答案没被接受 ⇒ 换题。
-      const sig = JSON.stringify(sol.pairs);
-      if (lastMatch === sig) {
-        rounds.push({ stage, kind, pairs: sol.pairs, note: '配对重复，换题' });
-        log(`  阶段${stage + 1} match 配对重复，换题`);
+
+      // ★★ 2026-10-06 同 odd：**match 改穷举**。
+      //   3 对 ⇒ 只有 3! = 6 种配对，其中**必有一个是对的**。
+      //   旧实现只试贪心解，答错后判「配对重复」就换题 ——
+      //   等于一次都没试过另外 5 种就放弃了（run#26 里 match 全是「配对重复，换题」）。
+      const mcid = st.capId || 'na';
+      if (!matchBF || matchBF.cid !== mcid) matchBF = { cid: mcid, tried: [] };
+      const mPerms = (sol.perms && sol.perms.length)
+        ? sol.perms.map((p) => p.pairs)
+        : [sol.pairs];
+      const mSig = (pr) => JSON.stringify(pr);
+      const mPick = mPerms.find((pr) => !matchBF.tried.includes(mSig(pr)));
+      if (!mPick) {
+        rounds.push({ stage, kind, note: 'match 六种配对全试过，换题',
+                      tried: matchBF.tried.slice() });
+        log(`  阶段${stage + 1} match 已试遍 ${mPerms.length} 种配对，换题`);
         const swOk = await switchKind(page);
         if (swOk) switchFails = 0;
         else if (++switchFails > 1) {
@@ -1262,9 +1267,22 @@ async function doRenew(page) {
         }
         continue;
       }
-      lastMatch = sig;
-      rounds.push({ stage, kind, pairs: sol.pairs, scores: sol.scores });
-      log(`  阶段${stage + 1} match 配对 ${JSON.stringify(sol.pairs)}`);
+      matchBF.tried.push(mSig(mPick));
+      lastMatch = mSig(mPick);
+      const box = await page.locator('#captcha_box_default').boundingBox();
+      const toPx = (lx, ly) => ({ x: box.x + (lx / 300) * box.width, y: box.y + (ly / 160) * box.height });
+      for (const [li, ri] of mPick) {
+        const a = toPx(58, MMETA.left[li].y);
+        await moveHuman(page, a.x, a.y); await page.mouse.click(a.x, a.y);
+        await page.waitForTimeout(500);
+        const bpt = toPx(242, MMETA.right[ri].y);
+        await moveHuman(page, bpt.x, bpt.y); await page.mouse.click(bpt.x, bpt.y);
+        await page.waitForTimeout(500);
+      }
+      // （旧的「配对重复 ⇒ 换题」已删除：6 种配对穷举取代了它。）
+      rounds.push({ stage, kind, pairs: mPick, scores: sol.scores,
+                    bfTry: matchBF.tried.length });
+      log(`  阶段${stage + 1} match 试配对 ${mSig(mPick)}（第 ${matchBF.tried.length}/${mPerms.length} 种）`);
     } else {
       // rotate 或未知题型：换题
       const sw = page.locator('#captcha_switch_default').first();
