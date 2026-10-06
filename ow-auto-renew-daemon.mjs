@@ -1488,7 +1488,14 @@ async function once() {
     }
 
     // 阈值：到期前 48h 内才真的动（平台每 24h 可续 1 次，别无节制点）
-    const THRESHOLD_H = Number(process.env.OW_THRESHOLD_H || 48);
+    // ★ 2026-10-06 实测：平台续期是把到期时间**重置为 now + 7 天**，
+    //   所以阈值 N 直接决定每轮有几天补救机会：
+    //     N=72  ⇒ 只有 D+4 / D+5 / D+6 三次机会
+    //     N=120 ⇒ D+2 … D+6 六次机会（且到期前至少还留 5 天缓冲）
+    //   工作流里 `OW_THRESHOLD_H` 写死 72（改它需要 PAT 带 workflow scope，
+    //   当前没有）⇒ 这里取 max(120, …) 兜住下限。
+    //   force 模式传 9999，max 后仍是 9999，语义不变。
+    const THRESHOLD_H = Math.max(120, Number(process.env.OW_THRESHOLD_H || 120));
     if (hl !== null && hl > THRESHOLD_H) {
       return { ok: true, skipped: true, hoursLeft: hl, renews: info.renews,
                note: `距到期 ${hl.toFixed(1)}h > 阈值 ${THRESHOLD_H}h，本轮不续` };
