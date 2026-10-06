@@ -574,12 +574,41 @@ async function launch() {
     userAgent: UA, locale: 'zh-CN', viewport: { width: 1920, height: 1000 },
     timezoneId: TZ_ID,
   });
-  await ctx.addCookies(cookies.map(c => ({
-    name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
-    httpOnly: !!c.httpOnly, secure: !!c.secure,
-    expires: c.expires && c.expires > 0 ? c.expires : undefined,
-    sameSite: c.sameSite || 'Lax',
-  })));
+  // ★★★ 2026-10-06：**即将过期的 cookie 自动延长**。
+  //
+  // 背景（实测 run 37447871220）：secret 里 `sessioncookie` 的 expires 被钉死在
+  //   2026-10-09 01:35:26Z（导出后 +7 天），而「到期前 120h 才续期」意味着
+  //   **首个真正的续期窗口在 10-09 之后** ⇒ 到点后 Chromium 会把它当过期 cookie
+  //   丢弃，必然 COOKIE_EXPIRED。
+  // 关键约束：**secret 里的值不会自己更新**（当前 PAT 无 `Secrets: write`，
+  //   API 403，无法回写），所以每次注入的都是 10-03 那份快照。
+  // 对策：注入时把「剩余 < 3 天」的 cookie 的 expires 往后延（**值不动**）。
+  //   · 服务端若只认 cookie 值（随机 session id）⇒ 这招能让自动化长期跑下去
+  //   · 服务端若还校验时间戳 ⇒ 会立刻表现为「登录态: false」，可即时回滚
+  // 长寿 cookie（`__session` 360d / `__client_uat` 395d）原样保留，不做多余改动。
+  const NOW_S = Date.now() / 1000;
+  const SOON_S = 3 * 86400;
+  const EXTEND_DAYS = 30;
+  const logCk = (tag, arr) => log(`cookie ${tag}:`, arr.map((c) => {
+    if (!(c.expires > 0)) return `${c.name}(len=${String(c.value || '').length},SESSION)`;
+    const exp = new Date(c.expires * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+    return `${c.name}(len=${String(c.value || '').length},exp=${exp},left=${((c.expires * 1000 - Date.now()) / 86400000).toFixed(2)}d)`;
+  }).join('  '));
+  logCk('注入前(secret 原样)', cookies);
+  const injected = cookies.map(c => {
+    const raw = (c.expires && c.expires > 0) ? c.expires : 0;
+    let exp;
+    if (!raw) exp = undefined;                                   // 本就是会话 cookie
+    else if (raw - NOW_S < SOON_S) exp = Math.floor(NOW_S + EXTEND_DAYS * 86400);
+    else exp = raw;                                              // 长寿的（__session 等）原样保留
+    return {
+      name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
+      httpOnly: !!c.httpOnly, secure: !!c.secure,
+      expires: exp, sameSite: c.sameSite || 'Lax',
+    };
+  });
+  await ctx.addCookies(injected);
+  logCk('注入后(实际下发)', injected);
   // 捕获验证码 meta（服务端下发的 kind/id/坐标），这是判题型与换题的唯一可靠依据
   await ctx.addInitScript(() => {
     const OW = window.WebSocket;
@@ -1469,41 +1498,30 @@ async function once() {
 
   let { browser, page } = await launch();
 
-  // ★★★ cookie 寿命诊断（2026-10-06 新增）。
-  //
-  // 动机：本机 ow_cookies.json（10-03 导出）里各 cookie 的寿命差异极大：
-  //   __session        len=810  到期 2027-10-02（360 天）  ← Clerk 认证，长寿
-  //   __client_uat     len=10   到期 2027-11-06（395 天）
-  //   sessioncookie    len=86   到期 2026-10-09（ 7 天！） ← 自研面板会话，短寿
-  // 而「到期前 120h 才续期」的阈值意味着**首个真正续期的窗口在 10-09 之后**，
-  // 与 sessioncookie 的到期日撞车。所以必须先回答：
-  //   每次打开面板，服务端会不会把 sessioncookie 的 expires 往后推？
-  //   · 会   ⇒ 只要定期把新 cookie 回写（或至少告警），自动化可长期跑
-  //   · 不会 ⇒ 10-09 之后所有运行都会 COOKIE_EXPIRED，必须重新导出
-  // 只打印 name/长度/过期时间，**绝不打印 value**（凭据不入日志）。
-  try {
-    const cks = await page.context().cookies();
-    const fmt = (c) => {
-      if (!(c.expires > 0)) return `${c.name}(len=${String(c.value || '').length},SESSION)`;
-      const exp = new Date(c.expires * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-      const left = ((c.expires * 1000 - Date.now()) / 86400000).toFixed(2);
-      return `${c.name}(len=${String(c.value || '').length},exp=${exp},left=${left}d)`;
-    };
-    log('cookie 现状:', cks.map(fmt).join('  '));
-    const sc = cks.find((c) => c.name === 'sessioncookie') || cks.find((c) => c.name === '__session');
-    if (sc && sc.expires > 0) {
-      cookieLeftDays = +((sc.expires * 1000 - Date.now()) / 86400000).toFixed(2);
-      if (cookieLeftDays < 1.5) {
-        log(`⛔ ${sc.name} 仅剩 ${cookieLeftDays} 天 —— 需尽快重新导出 ow_cookies.json 并更新 OW_COOKIES_B64`);
-      } else {
-        log(`  面板会话 cookie（${sc.name}）剩余 ${cookieLeftDays} 天`);
-      }
-    }
-  } catch (e) { log('cookie 诊断失败（不影响主流程）:', e.message); }
-
   try {
     await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(4000);
+
+    // ★ cookie 服务端响应后（2026-10-06）——与 launch() 里「注入后」的 expires 对比，
+    //   用来回答一个关键问题：**服务端会不会把 sessioncookie 的 expires 往后改写？**
+    //   · 改写 ⇒ 服务端是滑动续期（但每次注入的仍是 secret 里的旧快照，
+    //     所以「注入时延长 expires」依然是必需的）
+    //   · 不变 ⇒ 服务端只认 cookie 值、不看 expires
+    //     ⇒ launch() 里的延长加固就是有效解，自动化可长期跑
+    //   只打印 name/长度/过期时间，绝不打印 value。
+    try {
+      const cks = await page.context().cookies();
+      log('cookie 服务端响应后:', cks.map((c) => {
+        if (!(c.expires > 0)) return `${c.name}(len=${String(c.value || '').length},SESSION)`;
+        const exp = new Date(c.expires * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+        return `${c.name}(len=${String(c.value || '').length},exp=${exp},left=${((c.expires * 1000 - Date.now()) / 86400000).toFixed(2)}d)`;
+      }).join('  '));
+      const sc = cks.find((c) => c.name === 'sessioncookie') || cks.find((c) => c.name === '__session');
+      if (sc && sc.expires > 0) {
+        cookieLeftDays = +((sc.expires * 1000 - Date.now()) / 86400000).toFixed(2);
+        log(`  面板会话 cookie（${sc.name}）剩余 ${cookieLeftDays} 天`);
+      }
+    } catch (e) { log('cookie 诊断失败（不影响主流程）:', e.message); }
 
     const fp = await page.evaluate(() => window.__owFp || null);
     const info = await readRenew(page);
