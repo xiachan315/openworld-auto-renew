@@ -2,22 +2,37 @@ name: Openworld 自动续期
 
 on:
   schedule:
-    # 每天一次（北京 08:23），不要加密频率。
+    # ★★★ 2026-10-06 改版：从「每天固定一次」改为「每 2 小时唤醒 + 随机时段闸门」。
     #
-    # ★ 平台有「24h 冷却」：每 24h 只能成功续 1 次。
-    #   加密 cron（如每 2h）**不会增加成功次数**，只会让 3/4 的运行被服务端拒绝，
-    #   纯粹浪费 runner 时间。
-    #   正确策略 = 每天有效试 1 次 × 7 天 = 7 次机会。
-    #   题型在 5 种里随机，已通 4 种 ⇒ 单次成功率 4/5
-    #   ⇒ 7 次全败概率 = (1/5)^7 = 0.0013%
+    # 为什么改（用户诉求）：原来 `23 8 * * *` 是雷打不动的 UTC 08:23（北京 16:23）。
+    #   「每天都在同一分钟出现同一种自动化行为」本身就是一条显眼的机器人指纹 ——
+    #   出口 IP 每轮都换（住宅节点随机）只解决了网络维度，时间维度仍是规律的。
+    #   用户明确要求：别每天固定一个时间点，免得被风控盯上。
     #
-    # 阈值 72h：到期前 3 天开始尝试，避开「续期成功但冷却未过导致误判」。
-    # 平台规则「每 24h 可免费续 1 次」，所以一天最多成功续一次，多跑几次只是读状态。
-    - cron: '23 8 * * *'
+    # 怎么改：GitHub 的 `schedule` 只支持固定 cron，无法直接写「随机」。
+    #   所以这里改成**每 2 小时唤醒一次**（UTC 00/02/…/22，共 12 个窗口），
+    #   再由第一个 job `gate` 用「当天 UTC 日期」做 sha256 种子，确定性地
+    #   选出今天唯一的目标窗口；只有真正命中那个窗口的 run 才会继续跑，
+    #   其余 11 次在 gate 里就地退出 —— 不装依赖、不下载 Chromium、不碰目标站，
+    #   每次约 10~15 秒。
+    #   ⇒ 实际执行时刻在一天 12 个窗口里随机，而不是固定的一分钟。
+    #
+    # 为什么是每 2 小时而不是更高频：平台有「24h 冷却」，每 24h 只能成功续 1 次。
+    #   再高频也不会多成功一次，只会徒增 run 数。12 个窗口足够把执行时刻打散。
+    #
+    # 为什么用「日期种子」而不是 Math.random()：同一天会被唤醒 12 次，
+    #   必须 12 次算出同一个答案，否则永远撞不上；而且确定性意味着事后可复现
+    #   （能算出「那天本该几点跑」）。
+    #
+    # 阈值：workflow 侧给 72h，daemon 内部还会兜到 120h ⇒ 到期前 5 天进入窗口，
+    #   约 5 次机会；题型在 5 种里随机、已通全部题型 ⇒ 全败概率极低。
+    #   若某天那一次 schedule 恰好被 GitHub 丢弃（高负载时会 drop），
+    #   还有前后几天的窗口兜底。
+    - cron: '17 */2 * * *'
   workflow_dispatch:
     inputs:
       force:
-        description: '忽略 48h 阈值，强制尝试续期（用于验证链路）'
+        description: '忽略阈值，强制尝试续期（用于验证链路）'
         required: false
         default: '0'
 
@@ -29,9 +44,43 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  renew:
+  # ★★★ 随机时段闸门（2026-10-06）
+  #   把「固定时刻」变成「一天内 12 个窗口里随机一个」。
+  #   手动触发（workflow_dispatch）时恒放行，方便随时验证链路。
+  gate:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: 决定今天在哪个窗口执行
+        id: decide
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            echo "· 手动触发 ⇒ 跳过闸门，直接执行"
+            exit 0
+          fi
+          SEED=$(date -u +%Y%m%d)
+          H=$(printf '%s' "$SEED" | sha256sum | cut -c1-8)
+          TARGET=$(( 16#$H % 12 ))
+          NOW=$(( 10#$(date -u +%H) / 2 ))
+          echo "日期=$SEED  目标窗口=$TARGET（UTC $(printf '%02d' $((TARGET*2))):17）  当前窗口=$NOW"
+          if [ "$NOW" -eq "$TARGET" ]; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            echo "✅ 命中今天的随机窗口 $TARGET ⇒ 继续执行"
+          else
+            echo "run=0" >> "$GITHUB_OUTPUT"
+            echo "⏭ 未命中（今天窗口=$TARGET，当前=$NOW）⇒ 空跑退出：不装依赖、不碰目标站"
+          fi
+
+  renew:
+    needs: gate
+    if: needs.gate.outputs.run == '1'
+    runs-on: ubuntu-latest
+    # 60 分钟：随机抖动最多 20 分钟 + 住宅出口建立 + 验证码 + 续期，
+    # 实测完整一轮 6.9 分钟，留足余量。
+    timeout-minutes: 60
     env:
       # Clerk 会话 cookie（base64 的 JSON 数组）。在 repo 的
       # Settings -> Secrets and variables -> Actions 里加名为 OW_COOKIES_B64 的 secret。
@@ -42,8 +91,12 @@ jobs:
       # ★ 手动 force 调试时静默失败通知（避免刷屏）。
       #   cron 自动跑时不设 ⇒ 成功/失败都正常推送。
       TG_DEBUG: ${{ github.event.inputs.force == '1' && '1' || '' }}
-      # 距到期多少小时内才真的续（默认 48）
+      # 距到期多少小时内才真的续（daemon 侧还会兜底到 120）
       OW_THRESHOLD_H: ${{ github.event.inputs.force == '1' && '9999' || '72' }}
+      # ★ 随机抖动（分钟）：命中窗口后、接触目标站前再随机等 0~20 分钟，
+      #   让「读面板 / 解验证码 / 续期」的时刻在窗口内也带分钟级随机，
+      #   而不是卡在窗口起点的同一分钟。
+      OW_JITTER_MAX: '20'
       # 验证码失败预算有限，重试最多 2 次
       OW_MAX_TRY: '2'
       # 每个 cron 跑几次「重开浏览器会话」：换题在同一会话里会失效
