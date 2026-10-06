@@ -201,6 +201,50 @@ const grabTooFlat = (b64, kind) => {
   return false;
 };
 
+/**
+ * 反自动化闸门探测（2026-10-06 从页面源码挖出）。
+ *
+ * 页面内联脚本：
+ *   function detectAutomation() {
+ *     if (navigator.webdriver === true) return "navigator.webdriver";
+ *     if (window.__selenium_unwrapped || ... || window.domAutomationController)
+ *       return "automation-dom-flag";
+ *     if (/HeadlessChrome/i.test(navigator.userAgent || "")) return "headless-chrome-ua";
+ *     if (navigator.plugins && navigator.plugins.length === 0 &&
+ *         (!navigator.languages || navigator.languages.length === 0)) return "headless-props";
+ *     return null; }
+ *   if (botReason) blocked = true;
+ *   // blocked 时 initWS 直接 ws.send("bot:" + botReason)，服务端以 4403 关闭，
+ *   // 并 setStatus("Automated browser detected — verification disabled")
+ *
+ * ★ blocked 的致命之处：`submitSolution()` 第一行就 `if (blocked || ...) return;`
+ *   ⇒ **静默不提交**。日志上看就是「点了、value 也变了、stage 就是不动」，
+ *   极易误判成"求解器不准"。所以必须显式探测并快速失败。
+ */
+const automationBlocked = (page) => page.evaluate(() => {
+  const st = document.getElementById('captcha_status_default');
+  const status = st ? (st.innerText || '') : '';
+  if (/Automated browser detected/i.test(status)) return { blocked: true, reason: 'status-text', status };
+  // 直接照抄页面的判据，独立复核一遍
+  try {
+    if (navigator.webdriver === true) return { blocked: true, reason: 'navigator.webdriver', status };
+    const w = window;
+    if (w.__selenium_unwrapped || w.__webdriver_evaluate || w.__selenium_evaluate ||
+        w.__driver_evaluate || w.__fxdriver_evaluate || w._Selenium_IDE_Recorder ||
+        w.__webdriver_script_fn || w.__webdriver_script_func || w.__webdriver_script_url ||
+        w.__driver_script_fn || w.__driver_script_url || w._phantom || w.__nightmare ||
+        w.callPhantom || w.domAutomation || w.domAutomationController) {
+      return { blocked: true, reason: 'automation-dom-flag', status };
+    }
+    if (/HeadlessChrome/i.test(navigator.userAgent || '')) return { blocked: true, reason: 'headless-chrome-ua', status };
+    if (navigator.plugins && navigator.plugins.length === 0 &&
+        (!navigator.languages || navigator.languages.length === 0)) {
+      return { blocked: true, reason: 'headless-props', status };
+    }
+  } catch (e) {}
+  return { blocked: false, reason: null, status };
+});
+
 const ready = (page) => page.evaluate(() => {
   const bg = document.getElementById('captcha_bg_default');
   const st = document.getElementById('captcha_status_default');
@@ -1067,28 +1111,72 @@ async function doRenew(page) {
         await page.waitForTimeout(200);
       }
 
-      // 1) 真实拖动：只做行为采样。⚠️ 不要在这里松手提交 ——
-      //    pointerup 会立刻 submitSolution，而此时 value 还没调准。
-      //    做法：按下后拖回原位再松手，让"行为样本"有了但答案不变糟。
-      const targetPx = meta.boxX + (target / 300) * meta.boxW;
-      await page.mouse.down();
-      for (let k = 1; k <= 12; k++) {
-        const t = k / 12;
-        const e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-        await page.mouse.move(meta.chipCx + (targetPx - meta.chipCx) * e,
-                              meta.chipCy + (Math.random() - 0.5) * 2);
-        await page.waitForTimeout(20);
+      // ★★★ 2026-10-06 按**页面真实源码**重写提交路径（Tabbit 实测 + 读 page-src.js 得出）。
+      //
+      // 源码事实（`captcha` 内联脚本）：
+      //   chip.addEventListener("pointermove", e =>
+      //       apply(drag.v0 + (e.clientX - drag.sx) * (meta.w / boxW)));
+      //   window.addEventListener("pointerup", function () {
+      //       if (blocked || !drag) return; stopJitter(); drag = null;
+      //       if (meta) { rec(); submitSolution(); } });        // ← 松手**无条件**提交
+      //   submitSolution(){ if (blocked||verified||!meta||!ws||ws.readyState!==OPEN) return;
+      //       if (samples.length) ws.send("tr:" + ...); ws.send("ans:" + Math.round(value)); }
+      //
+      // 由此确认旧实现的 3 个错（都不是猜测，是可复现的行为差异）：
+      //
+      // ① **拖拽目标错半个 chip 宽**。协议是 `Δvalue = ΔclientX * meta.w / boxW`，
+      //    鼠标抓的是 chip **中心**；而旧代码把鼠标移到 `boxX + target/300*boxW`
+      //    —— 那是 chip **左缘**该到的位置。
+      //    Tabbit 实测：瞄 119，实际 `aria-valuenow` = 71 = 119 - 48（chip 宽 96 的一半）。
+      //    正确终点 = `chipCx + (target - v0) * boxW / meta.w`。
+      //
+      // ② **"拖回原位再松手"必然先提交一个错答案**。
+      //    旧注释以为"松手提交的 value 与初始一致，不会误判"——恰恰相反：
+      //    pointerup 是**无条件**提交Solution 的，于是这一发必定是错的，
+      //    白白消耗服务端的失败预算（实测约 3 次错就 `burned` 重开）。
+      //
+      // ③ **trackTo 是单点跳变，没有震颤轨迹**。
+      //    `rec()` 记 `[相对毫秒, value]`，上限 200 个，服务端做 tremor analysis。
+      //    旧 trackTo = 一次 move + down + up ⇒ 只有 2 个采样点 ⇒ 机器特征明显。
+      //
+      // ⇒ 新方案：**一次干净的拖拽直达目标再松手**。
+      //   一次提交、答案正确、轨迹带缓动 + 逐步抖动（供震颤分析）。
+      {
+        const v0 = await readVal();
+        const boxW = meta.boxW || 300;
+        const kInv = boxW / (meta.cm && meta.cm.w ? meta.cm.w : 300);  // Δpx = Δvalue * boxW/meta.w
+        const dxTotal = (target - v0) * kInv;
+        const STEPS = 26;
+        // 缓动（ease-in-out cubic）+ 逐 step 微抖动 + 末端回稳，逼近真人轨迹
+        await page.mouse.move(meta.chipCx, meta.chipCy);
+        await page.mouse.down();
+        await page.waitForTimeout(40 + Math.random() * 40);
+        for (let k = 1; k <= STEPS; k++) {
+          const t = k / STEPS;
+          const e = t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+          const noise = (Math.random() - 0.5) * (2.4 * (1 - t) + 0.5);
+          await page.mouse.move(
+            meta.chipCx + dxTotal * e + noise,
+            meta.chipCy + (Math.random() - 0.5) * 2.2,
+          );
+          await page.waitForTimeout(14 + Math.random() * 22);
+        }
+        // 末端轻修正回精确值（噪声可能带来 1~2px 偏差）
+        for (let g = 0; g < 6; g++) {
+          const cur = await readVal();
+          if (Math.abs(cur - target) <= 1) break;
+          const back = (target - cur) * kInv;
+          for (let k = 1; k <= 5; k++) {
+            await page.mouse.move(
+              meta.chipCx + dxTotal + back * (k / 5),
+              meta.chipCy + (Math.random() - 0.5) * 1.2,
+            );
+            await page.waitForTimeout(16);
+          }
+        }
+        await page.mouse.up();          // ← 这一发就是正确答案
+        await page.waitForTimeout(1400);
       }
-      // 拖回起始位再松手 —— 提交的 value 与初始一致，不会误判
-      for (let k = 12; k >= 0; k--) {
-        const t = k / 12;
-        const e = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-        await page.mouse.move(meta.chipCx + (targetPx - meta.chipCx) * e,
-                              meta.chipCy + (Math.random() - 0.5) * 2);
-        await page.waitForTimeout(16);
-      }
-      await page.mouse.up();
-      await page.waitForTimeout(1200);
 
       // 2) 键盘精确逼近。先验证一次按键是否真的改变 value（防焦点陷阱）
       let cur = await readVal();
@@ -1366,6 +1454,16 @@ async function once() {
     }
     const hl = hoursLeft(info.renews);
     log('距到期', hl === null ? '?' : hl.toFixed(1), '小时');
+
+    // ★ 反自动化闸门：blocked 时 submitSolution() 会**静默不提交**，
+    //   表现为「value 一直变、stage 就是不动」—— 极易误判成求解器不准。
+    //   这里显式探测并快速失败，把根因写进日志。
+    const blk = await automationBlocked(page);
+    if (blk.blocked) {
+      log('⛔ 反自动化闸门 blocked =', blk.reason, '| status =', JSON.stringify(blk.status));
+      return { ok: false, why: 'AUTOMATION_BLOCKED', rounds: [], blockedReason: blk.reason,
+               note: `页面判定为自动化浏览器（${blk.reason}），submitSolution() 会被静默跳过` };
+    }
 
     // 阈值：到期前 48h 内才真的动（平台每 24h 可续 1 次，别无节制点）
     const THRESHOLD_H = Number(process.env.OW_THRESHOLD_H || 48);
