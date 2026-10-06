@@ -59,6 +59,24 @@ let chromium = null;
   }
 }
 
+// ---------- 运行参数 ----------
+// ★ 2026-10-06 新增：参数外置到 `ow-config.json`。
+//   原因：当前 PAT **没有 Workflows 写权限**（GitHub 对 `.github/workflows/*`
+//   有独立权限位，改 renew.yml 会 403 `Resource not accessible by personal access token`），
+//   但 workflow 里写死了 `OW_SESSIONS: '4'` 和 `timeout-minutes: 45`
+//   ⇒ 调参只能走代码/配置文件。放这里，改一个数就能重跑，不用动 workflow。
+// 优先级：ow-config.json > 环境变量（workflow 的 env）> 代码默认值。
+let CFG = {};
+try {
+  CFG = JSON.parse(fs.readFileSync(path.join(__dirname, 'ow-config.json'), 'utf8'));
+} catch (e) { CFG = {}; }
+const cfgNum = (key, envName, def) => {
+  if (CFG[key] !== undefined && CFG[key] !== null) return Number(CFG[key]);
+  const v = process.env[envName];
+  if (v !== undefined && v !== '') return Number(v);
+  return def;
+};
+
 const UUID = 'aa78a361-a445-4d41-971b-26d609f1e942';
 const PANEL = `https://openworld.eu.org/vps/${UUID}`;
 
@@ -746,7 +764,7 @@ async function doRenew(page) {
   // ★ 单会话预算：run#27 里跑得最好的会话也只用了 5.6 分钟，
   //   而耗尽换题预算的会话 1.4~2.2 分钟就结束了 ⇒ 5 分钟足够，
   //   且能让 10 个会话塞进 36 分钟的全局预算里。
-  const DEADLINE_MS = Number(process.env.OW_ROUND_BUDGET_MS || 5 * 60 * 1000);
+  const DEADLINE_MS = cfgNum('roundBudgetMs', 'OW_ROUND_BUDGET_MS', 5 * 60 * 1000);
   const t0 = Date.now();
   for (let stage = 0; stage < 40; stage++) {
     if (Date.now() - t0 > DEADLINE_MS) {
@@ -1372,8 +1390,8 @@ async function once() {
     //   run#27 用 4 个会话只花了 13.3 分钟，而 job timeout 是 45 分钟 ⇒ 还有 3 倍余量。
     //   提到 10 个会话 ≈ 30~35 分钟，仍留安全边界；
     //   再加一层 TOTAL_BUDGET_MS 兜底，保证**总能在超时前带着结果返回**。
-    const SESSIONS = Number(process.env.OW_SESSIONS || 10);
-    const TOTAL_BUDGET_MS = Number(process.env.OW_TOTAL_BUDGET_MS || 36 * 60 * 1000);
+    const SESSIONS = cfgNum('sessions', 'OW_SESSIONS', 10);
+    const TOTAL_BUDGET_MS = cfgNum('totalBudgetMs', 'OW_TOTAL_BUDGET_MS', 36 * 60 * 1000);
     const tStart = Date.now();
 
     let r = { ok: false, why: 'NO_ATTEMPT', rounds: [], sessions: [] };
