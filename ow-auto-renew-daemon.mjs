@@ -263,6 +263,12 @@ async function grabChipPng(page) {
   // naturalWidth/Height=72，blob 5090 字节，签名 iVBORw0KGgo。
   const sel = '#captcha_chip_default';
 
+  // ---- 路径 0（2026-10-06 新增，首选）：WS 二进制帧 ----
+  //   chip 实测 72x72（key）或 96x96（puzzle）。两种尺寸都接受，按最新帧取。
+  //   headless 下元素截图同样会抓到空白（见 grabPng 的根因分析）。
+  const wsA = wsPick(page.__owCap, 72, 72) || wsPick(page.__owCap, 96, 96);
+  if (wsA && wsA.bytes > 1500) return wsA.b64;
+
   // ---- 路径 1：元素截图（无回传上限，首选）----
   try {
     const png = await page.locator(sel).first().screenshot({ type: 'png' });
@@ -311,24 +317,81 @@ async function grabChipPng(page) {
 
 /** 取页面**当前这道题**的 PNG（另开 ws 拿到的是另一题，必错） */
 async function grabPng(page) {
-  // ★ 与 grabChipPng 同一个坑：`page.evaluate` 的返回值有硬上限（实测 ~4KB 字符）。
-  //   背景 PNG 实测 17152 字节 ⇒ base64 后 22869 字符 ⇒ **必然被截断**
-  //   ⇒ 表现是「图片明明有 src，却解析失败 / 结果恒定」。
-  //   修法：**元素截图优先**（Buffer 直接在 Node 侧，绕过回传上限）。
+  // ★★★ 2026-10-06 在 GitHub runner（headless Chromium）上抓到的**新根因**：
+  //
+  // 症状：puzzle 题`grabBytes` 恒为 **3360 字节**（正常背景图 17KB~35KB），
+  //      紧随其后是 `no-gap-located`，探针坐标全挤在 y=260~277。
+  //      ⇒ 拿到的是一张**近乎纯色的空白图**，不是题目本身。
+  //
+  // 为什么本机（Edge 有头）不复现、headless Chromium 复现：
+  //   `#captcha_bg_default` 是 <img src=blob:…>。元素截图走的是**渲染后像素**。
+  //   headless 下 blob 图像的解码/合成与有头不同 —— 在图像尚未完成绘制时截图，
+  //   会得到一张**尺寸合法、PNG 合法、但内容空白**的图。
+  //   而旧代码只判`png.length > 200` ⇒ 空白图被当成成功 ⇒ 永不落到兜底路径。
+  //
+  // 修法（三层，缺一不可）：
+  //   ① 截图后**必须校验内容**，不是校验字节数；
+  //   ② 补 **clip 视口截图**兜底（元素截图空白时，换一种截法往往能拿到真图）；
+  //   ③ 补 **blob fetch** 兜底（最终保底：直接拿服务端下发的原始字节，
+  //      完全绕开渲染，与 headless/有头无关）。
+  //   另：等待图像解码完成（`decode()`），把"没解码完就截图"这个窗口关掉。
+  //
+  // ★ 2026-10-06 追加**路径 0（首选）**：WS 二进制帧直取（见 attachWsCapture）。
+  //   这是唯一与渲染无关的路径，headless 下也必然拿到服务端原始字节。
   const sel = '#captcha_bg_default';
 
-  // ---- 路径 1：元素截图 ----
+  const BIG = 8000;   // 背景图实测17KB~35KB；3360 = 空白图
+  const ok = (b) => b && b.length > BIG;
+
+  // ---- 路径 0（首选）：WS 二进制帧，Node 侧直取 ----
+  //   背景图实测 300x160 ⇒ 按尺寸挑帧，避免误拿 chip（72x72 / 96x96）。
+  const ws = wsPick(page.__owCap, 300, 160);
+  if (ws && ws.bytes > BIG) return { b64: ws.b64, via: 'ws', bytes: ws.bytes };
+  if (ws) log(`  [grabPng] WS 帧偏小(${ws.bytes}B ${ws.w}x${ws.h})，退到截图`);
+
+  // ---- 路径 0.5：等 blob 图像解码完成（关掉"未解码完就截图"的窗口）----
+  try {
+    await page.evaluate(async (s) => {
+      const img = document.querySelector(s);
+      if (img && img.tagName === 'IMG' && img.decode) { try { await img.decode(); } catch (_) {} }
+    }, sel);
+  } catch (e) { /* 不阻塞 */ }
+
+  // ---- 路径 1：元素截图 + 内容校验 ----
   try {
     const png = await page.locator(sel).first().screenshot({ type: 'png' });
-    if (png && png.length > 200) return { b64: png.toString('base64'), via: 'shot' };
-  } catch (e) { /* 落到 evaluate */ }
+    if (ok(png)) return { b64: png.toString('base64'), via: 'shot' };
+  } catch (e) { /* 落到 clip */ }
 
-  // ---- 路径 2：页面内 fetch blob（小图才可靠）----
+  // ---- 路径 2：视口内 clip 截图 ----
+  const box = await page.evaluate((s) => {
+    const c = document.querySelector(s);
+    if (!c) return null;
+    const r = c.getBoundingClientRect();
+    if (r.width < 8 || r.height < 8) return null;
+    // 必须完全在视口内，否则 clip 会截到空白
+    if (r.x < 0 || r.y < 0 || r.right > innerWidth || r.bottom > innerHeight) return null;
+    return { x: r.x, y: r.y, width: r.width, height: r.height };
+  }, sel);
+  if (box) {
+    try {
+      const png = await page.screenshot({
+        clip: { x: box.x, y: box.y, width: box.width, height: box.height }, type: 'png',
+      });
+      if (ok(png)) return { b64: png.toString('base64'), via: 'clip' };
+    } catch (e) { /* 落到 blob */ }
+  }
+
+  // ---- 路径 3：页面内 fetch blob（最终保底，绕开渲染）----
+  // ⚠️ 实测大图经 page.evaluate 回传会被截断在 ~4KB 字符（见 grabChipPng 注释），
+  //   所以 blob 路径**只对 chip 这种小图可靠**；背景图靠它也拿不到完整字节。
+  //   仍然保留：截断的 base64 至少能解出 IHDR 尺寸，用于诊断。
   const r = await page.evaluate(async (s) => {
     const bg = document.querySelector(s);
     if (!bg || !bg.src || !bg.src.startsWith('blob:')) return { err: 'no blob' };
     try {
-      const buf = await (await (await fetch(bg.src)).blob()).arrayBuffer();
+      const resp = await fetch(bg.src);
+      const buf = await resp.arrayBuffer();
       const u8 = new Uint8Array(buf);
       let bin = '';
       for (let i = 0; i < u8.length; i += 4096) {
@@ -337,8 +400,11 @@ async function grabPng(page) {
       return { b64: btoa(bin), bytes: u8.length };
     } catch (e) { return { err: 'fetch: ' + String(e.message).slice(0, 40) }; }
   }, sel);
-  if (r && r.b64) return { b64: r.b64, via: 'eval', bytes: r.bytes };
-  return { err: (r && r.err) || 'grab-failed' };
+  if (r && r.b64 && r.bytes >= BIG) {
+    return { b64: r.b64, via: 'blob', bytes: r.bytes };
+  }
+  return { err: (r && (r.err || `blob too small (${r.bytes || 0}B)`)) || 'grab-failed',
+           bytes: r && r.bytes };
 }
 
 // odd 题固定网格（实测 5/5 样本一致）
@@ -389,7 +455,70 @@ async function launch() {
   });
   await ctx.addInitScript(STEALTH);
   const page = await ctx.newPage();
+
+  // ★★★ 2026-10-06 run#25 后的架构级修复：**直接从 WebSocket 二进制帧取图**。
+  //
+  // 为什么必须换这条路（run#25 实测证据）：
+  //   puzzle 的 `grabBytes` 恒为 **3360 字节**，而正常背景图 17KB~35KB
+  //   ⇒ headless Chromium 的**元素截图抓到的是空白图**（尺寸合法、PNG 合法、内容空）。
+  //   `ready()` 里 `bg.complete` + `naturalWidth>=100` 全都通过
+  //   ⇒ 证明 DOM 侧图像已解码完，**空白是渲染/合成环节的问题，不是时序问题**。
+  //   这就是为什么本机（Edge 有头）一切正常、runner（headless Chromium）全题型崩。
+  //
+  // 服务端下发验证码走的是 WS：text 帧 = meta（含坐标），**binary 帧 = PNG 原始字节**。
+  // ⇒ 在 Node 侧拦截 WS 帧，直接拿到服务器发的 PNG：
+  //   · 不依赖渲染（headless/有头无关）
+  //   · 不受 `page.evaluate` ~4KB 回传上限影响（Buffer 在 Node 侧）
+  //   · 字节与服务端完全一致，不会有缩放/裁剪/DPR 差异
+  // 截图路径降级为兜底。
+  attachWsCapture(page);
+
   return { browser, page };
+}
+
+/**
+ * 拦截验证码 WebSocket：text 帧存 meta，binary 帧存 PNG 原始字节。
+ *
+ * ⚠️ 必须在 `goto` **之前**注册 —— 面板一加载就会开 WS，晚一帧就漏掉首题。
+ */
+function attachWsCapture(page) {
+  const cap = { meta: null, bin: [], metaSeq: 0 };
+  page.__owCap = cap;
+  page.on('websocket', (ws) => {
+    const url = ws.url ? ws.url() : '';
+    if (!/captcha/i.test(url)) return;
+    const onFrame = (frame) => {
+      // Playwright 各版本回调签名不一致：有的传 payload，有的传 { payload }
+      const p = (frame && frame.payload !== undefined) ? frame.payload : frame;
+      if (typeof p === 'string') {
+        try {
+          const d = JSON.parse(p);
+          if (d && d.kind && d.id) { cap.meta = d; cap.metaSeq++; }
+        } catch (e) { /* 非 meta 文本帧 */ }
+      } else if (Buffer.isBuffer(p) && p.length > 500) {
+        cap.bin.push({ buf: p, seq: cap.metaSeq, at: Date.now() });
+        if (cap.bin.length > 12) cap.bin.shift();
+      }
+    };
+    ws.on('framereceived', onFrame);
+    ws.on('framesent', onFrame);
+  });
+}
+
+/** 从 WS 捕获帧里挑一张 PNG：按 IHDR 宽高过滤，取最近的一张 */
+function wsPick(cap, wantW, wantH) {
+  if (!cap || !cap.bin || !cap.bin.length) return null;
+  // 从后往前找：最新的一帧
+  for (let i = cap.bin.length - 1; i >= 0; i--) {
+    const b = cap.bin[i].buf;
+    if (b.length < 24 || b.toString('ascii', 1, 4) !== 'PNG') continue;
+    const w = b.readUInt32BE(16), h = b.readUInt32BE(20);
+    if (w < 8 || h < 8) continue;
+    if (wantW && Math.abs(w - wantW) > Math.max(8, wantW * 0.35)) continue;
+    if (wantH && Math.abs(h - wantH) > Math.max(8, wantH * 0.35)) continue;
+    return { b64: b.toString('base64'), w, h, bytes: b.length, seq: cap.bin[i].seq };
+  }
+  return null;
 }
 
 /**
@@ -637,28 +766,43 @@ async function doRenew(page) {
       png = await grabPng(page);
     }
     if (png.err) return { ok: false, why: 'GRAB_FAIL:' + png.err, rounds, grabRetry };
-    // 记录抓取路径：'shot' = 元素截图（不受 ~4KB 回传上限影响，可信）
-    //                'eval' = 页面内 fetch blob（超过上限会被静默截断）
+    // 记录抓取路径：'shot' = 元素截图 | 'clip' = 视口 clip 截图 | 'blob' = 页面内 fetch
     grabVia = png.via || '?';
     grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
     // ★ 二次校验：PNG 头里的宽高必须够大。
-    //   实测（run#20）：半渲染时截到 3360 字节的背景图，解码后尺寸不足 ⇒ 求解器必错。
-    //   元素截图本身不报错，只能靠**尺寸**判断抓到了空图。
-    if (grabTooSmall(png.b64, 'bg') || grabTooFlat(png.b64, 'bg')) {
-      grabRetry++;
-      const info = imageInfoScore(png.b64) || {};
-      log(`  阶段${stage + 1} 抓到空图（${grabBytes}B, std=${info.std}, range=${info.range}` +
-          `，重试 ${grabRetry}/3），重等就绪`);
-      await page.waitForTimeout(1200);
-      if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds, grabRetry };
-      png = await grabPng(page);
-      if (png.err || grabTooSmall(png.b64, 'bg') || grabTooFlat(png.b64, 'bg')) {
-        const i2 = imageInfoScore(png.b64) || {};
-        return { ok: false, why: 'GRAB_EMPTY', rounds, grabRetry, grabVia,
-                 bytes: i2, note: `像素尺寸正常但内容单调（std=${i2.std}），判定为空白图` };
+    //   实测（run#20/#25）：半渲染时截到 3360 字节的背景图，解码后尺寸不足 ⇒ 求解器必错。
+    //   ⚠️ run#25（2026-10-06）证明**尺寸校验不足以拦住它**：
+    //   headless Chromium 抓到的是「尺寸合法、PNG 合法、内容空白」的图，
+    //   `naturalWidth` 也正常（DOM 侧确实解码完成了）⇒ 旧的 size/range 判据全部放行，
+    //   于是空白图一路流到 solveGap ⇒ 报`no-gap-located` ⇒ 看起来像"算法不行"，
+    //   实际是"输入是空图"。**必须按字节数拦**（正常 17KB~35KB，空白 3360B）。
+    //   真正的解法在 grabPng 内部：shot 不合格就退到 clip / blob。
+    const tooSmall = () => grabTooSmall(png.b64, 'bg');
+    const tooFlat  = () => grabTooFlat(png.b64, 'bg');
+    // 字节数下限：低于此值一律视为"没抓到真图"
+    const tiny = () => grabBytes < 8000;
+    let quality = { std: null, range: null, w: null, h: null };
+    if (tiny() || tooSmall() || tooFlat()) {
+      quality = imageInfoScore(png.b64) || {};
+      for (; grabRetry < 3; grabRetry++) {
+        log(`  阶段${stage + 1} 抓到空图（via=${grabVia}, ${grabBytes}B, ` +
+            `std=${quality.std}, range=${quality.range}, ${quality.w}x${quality.h}），` +
+            `重试 ${grabRetry + 1}/3，重等就绪`);
+        await page.waitForTimeout(1500);
+        if (!await waitReady(page)) return { ok: false, why: 'NOT_READY', rounds, grabRetry };
+        png = await grabPng(page);          // ★ 重新走完整三路径，命中 clip/blob
+        if (png.err) continue;
+        grabVia = png.via || '?';
+        grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
+        if (!(tiny() || tooSmall() || tooFlat())) { quality = {}; break; }
+        quality = imageInfoScore(png.b64) || {};
       }
-      grabVia = png.via || '?';
-      grabBytes = png.b64 ? Math.round(png.b64.length * 3 / 4) : 0;
+      if (tiny() || tooSmall() || tooFlat()) {
+        return { ok: false, why: 'GRAB_EMPTY', rounds, grabRetry, grabVia,
+                 bytes: { ...quality, grabBytes }, grabPath: grabVia,
+                 note: `三次抓图都拿到空白/退化图（最后 ${grabBytes}B via=${grabVia}, ` +
+                       `std=${quality.std}, range=${quality.range}）` };
+      }
     }
     const img = await decodePng(page, png.b64);
     if (!img || img.w < 100 || img.h < 60) {   // img 是背景图（300x160）
@@ -954,7 +1098,17 @@ async function doRenew(page) {
           //   （成功那次 owrun7：`rotate value=0 chip→0 STAGE 2/6` —— stage 推进了）。
           //   若这次仍不推进，说明该题缺口方向不是 0°，而主轴法 aniso=0.027 算不出角度
           //   ⇒ 立刻换题，别纠缠（owrun14 里 rotate 吃了 16 阶段耗尽预算 → KEY_STUCK）。
-          const sameFigRetry = (rotateSameFig = rotateSameFig || 0) + 1;
+          // ★★ 真 bug（2026-10-06 run#25 抓到）：原写法
+          //     `const sameFigRetry = (rotateSameFig = rotateSameFig || 0) + 1;`
+          //   括号位置错了 —— 赋值表达式 `(rotateSameFig = rotateSameFig || 0)`
+          //   的值恒等于当前值（0），**rotateSameFig 永远不自增** ⇒ sameFigRetry 恒为 1
+          //   ⇒ 恒 `<= ROTATE_MAX_RETRY(1)` ⇒ **换题分支永远进不去**。
+          //   run#25 日志直接印证：阶段10~40 连续 30 个阶段全是
+          //   `rotate 同图再试 1 次（若仍不行就换题）`，**一次都没真换过题**，
+          //   整场 8 分钟烧在同一道题上，最后 NOT_READY 收场。
+          //   正确写法：先自增，再取值。
+          rotateSameFig = (rotateSameFig || 0) + 1;
+          const sameFigRetry = rotateSameFig;
           const ROTATE_MAX_RETRY = 1;
           if (!(kind === 'rotate' && sameFigRetry <= ROTATE_MAX_RETRY)) {
             rounds.push({ stage, kind, value: target, note: '定位重复，换题',
