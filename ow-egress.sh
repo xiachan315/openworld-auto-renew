@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ow-egress.sh — 给续期请求建立「住宅出口」（v4, 2026-10-06）
+# ow-egress.sh — 给续期请求建立「住宅出口」（v5, 2026-10-06）
 #
 # 为什么需要：
 #   run 37438598628（GitHub/Azure runner）：验证码 6 阶段**全部通过**、
@@ -9,17 +9,16 @@
 #      to renew a VPS."
 #   ⇒ 机房 IP 被封。**验证码解得再完美也没用**，必须从住宅 IP 出去。
 #
-# 做法：VPN Gate（vpngate.net）公共中继 = 志愿者自家宽带，出口 ASN 是消费级 ISP。
-#
-# 失败复盘：
-#  v1（37440166009）：awk+IFS 解析没生效，循环体一次没进。
-#  v2（37441134613）：解析出 90 个中继，但 base64 -d 全失败（CRLF / 逗号错位）。
-#  v3（37441808386）：解析 OK（配置 ~10KB），但 13 个节点**全都「隧道未建立」，
-#      且我的错误诊断打印是空的** ⇒ openvpn 的 stdout/stderr 被
-#      `--daemon` + `2>/dev/null` 一起吞了，$LOG 里一个字节都没有。
-#      **诊断为空 = 没有诊断。** v4 起：openvpn 输出重定向到文件并在失败时打印。
-#      同时预处理掉 OpenVPN 2.6 **已移除**的指令（VPN Gate 老配置常见
-#      `ns-cert-type server` ⇒ 直接 Options error 退出，日志为空正是这个特征）。
+# 失败复盘（每一步都是"诊断缺失"导致的空转）：
+#  v1 37440166009：awk+IFS 解析没生效，循环体一次没进。
+#  v2 37441134613：解析出 90 个中继，但 base64 -d 全失败（CRLF / 逗号错位）。
+#  v3 37441808386：解析 OK，13 个节点全"隧道未建立"，**诊断打印为空**。
+#  v4 37443270643：20 个节点全部"隧道未建立"，**诊断打印依旧为空** ——
+#      连续两版都拿不到 openvpn 的一个字节输出。
+#      ⇒ 结论：`--daemon` 会把输出彻底吞掉（父进程静默退出、子进程另开 fd），
+#        再叠加 stderr 重定向就完全失明。
+#  **v5 起彻底不用 --daemon**：用 `setsid` 后台跑 + stdout/stderr 直接重定向到文件
+#  + 轮询该文件。宁可多花 1~2 秒，也必须永远看得见 openvpn 说了什么。
 #
 # 产出：/tmp/ow-egress.ip / /tmp/ow-egress.info
 # 退出码 0 = 已拿到住宅出口；非 0 = 失败（调用方必须视为致命错误）
@@ -32,13 +31,12 @@ CLEAN=/tmp/ow-vg.clean
 CAND=/tmp/ow-vg.cand
 OVPN=/tmp/ow-vg.ovpn
 FIX=/tmp/ow-vg.fixed
-LOG=/tmp/ow-vg.log
-RUNLOG=/tmp/ow-vg.run.log
+VLOG=/tmp/ow-vg.log
 
 echo "[egress] 安装 openvpn ..."
 sudo apt-get update -qq >/dev/null 2>&1 || true
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openvpn curl >/dev/null 2>&1 || true
-if ! command -v openvpn >/dev/null 2>&1; then echo "[egress] openvpn 安装失败"; exit 2; fi
+command -v openvpn >/dev/null 2>&1 || { echo "[egress] openvpn 安装失败"; exit 2; }
 openvpn --version 2>/dev/null | head -1
 
 sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
@@ -73,13 +71,10 @@ while IFS= read -r line; do
   TOTAL=$((TOTAL + 1))
 done < "$CLEAN"
 echo "[egress] 解析出可用中继 $TOTAL 个"
-sort -n /tmp/ow-vg.raw | head -20 > "$CAND"
+sort -n /tmp/ow-vg.raw | head -12 > "$CAND"
 echo "[egress] 取延迟最低的 $(wc -l < "$CAND") 个逐个尝试"
 
-# OpenVPN 2.6 兼容：
-#   · ns-cert-type 在 2.5 已被**移除** ⇒ 换成 remote-cert-tls server
-#   · comp-lzo 已废弃 ⇒ 删掉（改由命令行控制压缩）
-#   · BF-CBC 默认禁用 ⇒ 由命令行 --data-ciphers-fallback 放行
+# OpenVPN 2.6 兼容：ns-cert-type 已在 2.5 移除；comp-lzo 废弃；redirect-gateway 由我们自加
 prep_ovpn() {
   grep -v -iE '^[[:space:]]*(comp-lzo|ns-cert-type|redirect-gateway)' "$1" > "$2"
   printf 'remote-cert-tls server\n' >> "$2"
@@ -87,48 +82,41 @@ prep_ovpn() {
 }
 CIPHERS="AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-256-CBC:AES-128-CBC:BF-CBC"
 
-OK=0; TRY=0; BAD=0
+OK=0; TRY=0
 while IFS="	" read -r PING B64 CC; do
   [ -n "${B64:-}" ] || continue
   TRY=$((TRY + 1))
-  if ! printf '%s' "$B64" | base64 -d > "$OVPN" 2>/dev/null; then
-    BAD=$((BAD + 1)); echo "[egress]   #$TRY base64 解码失败"; continue
-  fi
+  printf '%s' "$B64" | base64 -d > "$OVPN" 2>/dev/null || { echo "[egress]   #$TRY 解码失败"; continue; }
   prep_ovpn "$OVPN" "$FIX"
-  echo "[egress] --- #$TRY ping=${PING}ms cc=${CC} ---"
+
   sudo pkill -x openvpn >/dev/null 2>&1 || true
-  : > "$LOG"; : > "$RUNLOG"
   sleep 1
-  sudo openvpn --config "$FIX" --auth-user-pass "$AUTH" \
+  : > "$VLOG"
+  # ★ 不用 --daemon：setsid 后台 + 输出直落文件，永远看得见
+  sudo setsid openvpn --config "$FIX" --auth-user-pass "$AUTH" \
        --data-ciphers "$CIPHERS" --data-ciphers-fallback BF-CBC \
        --tls-version-min 1.0 --tls-cert-profile insecure \
-       --daemon --log "$LOG" --verb 3 \
-       --connect-retry 1 --connect-retry-max 1 --connect-timeout 10 \
-       --resolv-retry 0 > "$RUNLOG" 2>&1 || true
+       --verb 3 --connect-retry 1 --connect-retry-max 1 --connect-timeout 8 \
+       --resolv-retry 0 >> "$VLOG" 2>&1 &
+  sleep 1
 
   UP=0
   for _ in $(seq 1 12); do
     sleep 2
-    if grep -q "Initialization Sequence Completed" "$LOG" 2>/dev/null; then UP=1; break; fi
-    if grep -qiE "Options error|Unrecognized option|Exiting due to fatal error|AUTH_FAILED" "$RUNLOG" "$LOG" 2>/dev/null; then break; fi
+    grep -q "Initialization Sequence Completed" "$VLOG" 2>/dev/null && { UP=1; break; }
   done
+
+  echo "[egress] --- #$TRY ping=${PING}ms cc=${CC} up=$UP ---"
   if [ "$UP" != "1" ]; then
-    echo "[egress]   隧道未建立。openvpn 输出："
-    { cat "$RUNLOG" 2>/dev/null; tail -6 "$LOG" 2>/dev/null; } \
-      | grep -vE '^\s*$' | tail -6 | sed 's/^/[egress]     /'
-    # 配置本身就是坏的 ⇒ 换节点没意义，直接停下
-    if grep -qiE "Options error|Unrecognized option" "$RUNLOG" 2>/dev/null; then
-      echo "[egress]   ⛔ 配置解析失败（OpenVPN 版本不兼容），提前结束"
-      break
-    fi
+    head -14 "$VLOG" 2>/dev/null | sed 's/^/[egress]     /'
     continue
   fi
 
   IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
   INFO=$(curl -s --max-time 14 "https://ipinfo.io/$IP/json" 2>/dev/null || true)
-  echo "[egress]   隧道已建立，出口 IP=$IP"
+  echo "[egress]   出口 IP=$IP"
   echo "[egress]   $(printf '%s' "$INFO" | tr -d '\n' | cut -c1-160)"
-  [ -n "$IP" ] || { echo "[egress]   ⚠️ 取不到出口 IP，换节点"; continue; }
+  [ -n "$IP" ] || continue
   if printf '%s' "$INFO" | grep -Eiq 'Amazon|Microsoft|Google|Cloudflare|DigitalOcean|Hetzner|OVH|M247|Oracle|Linode|Vultr|Contabo|Leaseweb|AS16509|AS8075|AS15169|AS13335|AS14061|AS9009'; then
     echo "[egress]   ⚠️ 出口是机房 ASN，换节点"; continue
   fi
@@ -138,7 +126,7 @@ while IFS="	" read -r PING B64 CC; do
 done < "$CAND"
 
 if [ "$OK" != "1" ]; then
-  echo "[egress] 未能拿到住宅出口（尝试 $TRY 个，其中 $BAD 个配置无效）"
+  echo "[egress] 未能拿到住宅出口（尝试 $TRY 个）"
   exit 4
 fi
 echo "[egress] ✅ 住宅出口 = $(cat /tmp/ow-egress.ip)"
