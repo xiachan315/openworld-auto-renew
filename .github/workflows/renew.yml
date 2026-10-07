@@ -53,6 +53,7 @@ jobs:
     outputs:
       run: ${{ steps.final.outputs.run }}
       date: ${{ steps.when.outputs.date }}
+      manual: ${{ steps.when.outputs.manual }}
     steps:
       - name: ① 计算今天的随机时刻
         id: when
@@ -62,6 +63,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$AUTO" != "1" ]; then
             echo "date=$SEED" >> "$GITHUB_OUTPUT"
             echo "time_ok=1" >> "$GITHUB_OUTPUT"
+            echo "manual=1" >> "$GITHUB_OUTPUT"
             echo "· 人工手动触发 ⇒ 跳过闸门，直接执行"
             exit 0
           fi
@@ -70,6 +72,7 @@ jobs:
           TARGET_MIN=$(( SLOT * 20 ))
           NOW_MIN=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
           echo "date=$SEED" >> "$GITHUB_OUTPUT"
+          echo "manual=0" >> "$GITHUB_OUTPUT"
           printf '日期=%s  目标时刻=%02d:%02d(UTC)  当前=%02d:%02d(UTC)\n' \
             "$SEED" $((TARGET_MIN/60)) $((TARGET_MIN%60)) $((NOW_MIN/60)) $((NOW_MIN%60))
           if [ "$NOW_MIN" -ge "$TARGET_MIN" ]; then
@@ -82,7 +85,7 @@ jobs:
 
       - name: ② 查当天是否已经执行过
         id: mark
-        if: steps.when.outputs.time_ok == '1'
+        if: steps.when.outputs.time_ok == '1' && steps.when.outputs.manual != '1'
         uses: actions/cache/restore@v4
         with:
           path: .ow-try
@@ -92,6 +95,11 @@ jobs:
       - name: ③ 决定今天跑不跑
         id: final
         run: |
+          if [ "${{ steps.when.outputs.manual }}" = "1" ]; then
+            echo "run=1" >> "$GITHUB_OUTPUT"
+            echo "· 人工手动 ⇒ 豁免「随机时刻」与「当日标记」两道检查"
+            exit 0
+          fi
           if [ "${{ steps.when.outputs.time_ok }}" != "1" ]; then
             echo "run=0" >> "$GITHUB_OUTPUT"
             exit 0
