@@ -576,7 +576,14 @@ async function launch() {
     ...(EDGE_ENV ? { executablePath: EDGE_ENV } : {}),
     headless: process.env.OW_HEADLESS !== '0',
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox',
-           '--disable-dev-shm-usage', '--disable-gpu'],
+           '--disable-dev-shm-usage', '--disable-gpu',
+           // ★ 2026-10-09：本机调试专用开关。Windows 上 Chromium 走**系统代理**
+           //   （本机 Karing 之类），于是「用本机住宅 IP 实测」其实测的是代理出口：
+           //   实测同一台机器 curl 直连 = 183.198.206.247(河北移动)，
+           //   而无头 Edge 走系统代理 = 104.28.x(Cloudflare 东京) ⇒ 实测结论完全作废。
+           //   加 `--no-proxy-server` 后浏览器出口 = 183.198.206.247，才是真住宅。
+           //   CI（GitHub runner）没有系统代理，加不加都一样。
+           ...(process.env.OW_NO_PROXY === '1' ? ['--no-proxy-server'] : [])],
   });
   // ★ 时区固定为 Asia/Shanghai。实测（2026-10-05）：
   //   面板按**浏览器本地时区**渲染到期时间，同一时刻：
