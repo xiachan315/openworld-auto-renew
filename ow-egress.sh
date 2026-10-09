@@ -73,8 +73,15 @@ while IFS= read -r line; do
   TOTAL=$((TOTAL + 1))
 done < "$CLEAN"
 echo "[egress] 解析出可用中继 $TOTAL 个"
-sort -n /tmp/ow-vg.raw | head -14 > "$CAND"
-echo "[egress] 取延迟最低的 $(wc -l < "$CAND") 个逐个尝试"
+# ★ 2026-10-09：候选从 14 提到 26。
+#   原因：低延迟 ≠ 住宅。实测选中的 150.40.105.10 是保加利亚机房 `MAXKO d.o.o.`
+#   （AS211619），不在品牌黑名单里 ⇒ 被放行 ⇒ 平台回 `flagged (VPN, proxy)`。
+#   放宽候选数 + 下面的正向判定，才可能在 VPN Gate 的杂牌中继里筛出真住宅出口。
+sort -n /tmp/ow-vg.raw | head -26 > "$CAND"
+NCAND=$(wc -l < "$CAND")
+# 前 60% 只收「正向判定为住宅」的；剩下的是兜底区（避免整轮颗粒无收）
+RELAX_AFTER=$(( NCAND * 6 / 10 ))
+echo "[egress] 取延迟最低的 $NCAND 个逐个尝试（前 $RELAX_AFTER 个要求住宅判定通过）"
 
 prep_ovpn() {
   grep -v -iE '^[[:space:]]*(comp-lzo|ns-cert-type|redirect-gateway)' "$1" > "$2"
@@ -124,20 +131,43 @@ while IFS="	" read -r PING B64 CC; do
 
   IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
   INFO=$(curl -s --max-time 14 "https://ipinfo.io/$IP/json" 2>/dev/null || true)
+  [ -n "$IP" ] || continue
+  # ★ 2026-10-09 新增：**正向证据**判定。品牌黑名单（下面那条）只能挡住大厂，
+  #   挡不住 MAXKO 这种小机房 ⇒ 必须看情报库的 hosting/proxy 结论。
+  #   ip-api.com 免费、无需 key（限 45 次/分钟，够用）。
+  RISK=$(curl -s --max-time 12 "http://ip-api.com/json/$IP?fields=status,country,isp,org,as,proxy,hosting,mobile" 2>/dev/null || true)
   echo "[egress]   出口 IP=$IP"
   echo "[egress]   $(printf '%s' "$INFO" | tr -d '\n' | cut -c1-160)"
-  [ -n "$IP" ] || continue
+  echo "[egress]   ip-api: $(printf '%s' "$RISK" | tr -d '\n' | cut -c1-220)"
+  BRAND_BAD=0
   if printf '%s' "$INFO" | grep -Eiq 'Amazon|Microsoft|Google|Cloudflare|DigitalOcean|Hetzner|OVH|M247|Oracle|Linode|Vultr|Contabo|Leaseweb|AS16509|AS8075|AS15169|AS13335|AS14061|AS9009'; then
-    echo "[egress]   ⚠️ 出口是机房 ASN，换节点"; continue
+    BRAND_BAD=1
   fi
-  printf '%s' "$IP" > /tmp/ow-egress.ip
-  printf '%s' "$INFO" > /tmp/ow-egress.info
-  OK=1; break
+  RISK_OK=0
+  if printf '%s' "$RISK" | grep -q '"status":"success"' \
+     && ! printf '%s' "$RISK" | grep -Eq '"hosting":true|"proxy":true'; then
+    RISK_OK=1
+  fi
+  if [ "$BRAND_BAD" = "1" ]; then
+    echo "[egress]   ⚠️ 命中机房品牌黑名单，换节点"; continue
+  fi
+  if [ "$RISK_OK" = "1" ]; then
+    echo "[egress]   ✅ 住宅判定通过（ip-api: hosting/proxy 均为 false）"
+    OK=1; break
+  fi
+  if [ "$TRY" -ge "$RELAX_AFTER" ]; then
+    echo "[egress]   ⚠️ 已进入兜底区（第 $TRY/$NCAND 个）：ip-api 未判为住宅，仍然采用"
+    OK=1; break
+  fi
+  echo "[egress]   ⚠️ ip-api 未判为住宅（或查询失败），继续换节点"; continue
 done < "$CAND"
 
 if [ "$OK" != "1" ]; then
   echo "[egress] 未能拿到住宅出口（尝试 $TRY 个）"
   exit 4
 fi
+# 只在**接受时**落盘（循环里 break 出来 ⇒ $IP/$INFO 就是被采纳的那个节点）
+printf '%s' "$IP" > /tmp/ow-egress.ip
+printf '%s' "$INFO" > /tmp/ow-egress.info
 echo "[egress] ✅ 住宅出口 = $(cat /tmp/ow-egress.ip)"
 exit 0
