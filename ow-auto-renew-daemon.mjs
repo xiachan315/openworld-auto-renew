@@ -1647,8 +1647,18 @@ async function once() {
       if (r.rounds && r.rounds.length) log(`会话 ${si + 1} 结束：${r.rounds.length} 阶段（${r.why || '未通过'}），重开会话`);
 
     }
+    // ★ 2026-10-09 修复：平台可能在**无任何报错**的情况下不受理续期。
+    //   实证 run 37860873448（10-08 23:42 UTC）：4 个验证码阶段全解、Confirm 已点、
+    //   页面无冷却话术，但 Renews until 纹丝不动（仍 10-13 17:59）⇒ 之前被误报「续期成功」。
+    //   ⇒ 唯一可信判据 = **到期时间是否真的变化**；读之前先 reload 拿新值。
+    try { await page.reload({ waitUntil: 'domcontentloaded', timeout: 60000 }); await page.waitForTimeout(4000); } catch (e) {}
     const after = await readRenew(page);
-    return { ...r, hoursLeft: hl, renewsBefore: info.renews, after, cookieLeftDays };
+    let ok2 = r.ok, why2 = r.why;
+    if (r.ok && !r.throttled && !r.skipped) {
+      const b = info.renews, a = (after && after.renews) || r.renewsAfter || null;
+      if (b && a && String(b) === String(a)) { ok2 = false; why2 = 'RENEW_NO_EFFECT'; }
+    }
+    return { ...r, ok: ok2, why: why2, hoursLeft: hl, renewsBefore: info.renews, after, cookieLeftDays };
   } finally {
     await browser.close();
   }
