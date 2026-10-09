@@ -1483,16 +1483,23 @@ function ensureResidentialEgress() {
     return { ok: false, note: '仓库里没有 ow-egress.sh' };
   }
   const readTmp = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch (e) { return ''; } };
+  // ★ 2026-10-09：把 ow-egress.sh 的**完整输出**落到文件。
+  //   动机：脚本每轮筛节点的 `[egress] ip-api: …` 判定行原本被 execSync 吞掉，
+  //   只看得到「住宅出口 = x.x.x.x」，无法回答「为什么选中这个（是严格通过还是兜底）」。
+  //   工作流的失败产物步骤会上传 `*.log` ⇒ 落在仓库目录里就能被带出来。
+  const dump = (out) => { try { fs.writeFileSync(path.join(__dirname, 'ow-egress.log'), String(out || '')); } catch (e) {} };
   try {
     const out = execSync('bash ow-egress.sh', {
       cwd: __dirname, encoding: 'utf8', timeout: 900000, maxBuffer: 8 << 20,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    dump(out);
     const ip = readTmp('/tmp/ow-egress.ip');
     if (!ip) return { ok: false, note: '脚本退出 0 但没写出出口 IP', tail: String(out).slice(-500) };
     return { ok: true, ip, info: readTmp('/tmp/ow-egress.info'), tail: String(out).slice(-800) };
   } catch (e) {
     const tail = [String(e.stdout || ''), String(e.stderr || '')].join('\n').slice(-800);
+    dump([String(e.stdout || ''), String(e.stderr || '')].join('\n'));
     return { ok: false, note: 'ow-egress.sh 失败：' + String(e.message).slice(0, 160), tail };
   }
 }
@@ -1526,6 +1533,14 @@ async function once() {
   else {
     log('住宅出口 =', eg.ip);
     log('  出口归属:', String(eg.info || '').replace(/\s+/g, ' ').slice(0, 180));
+    // ★ 2026-10-09：把每个候选节点的 ip-api 判定行也摆到日志里。
+    //   否则只能看到「最终选了谁」，看不到「前面那些为什么被否」——
+    //   而「是被严格判定选中，还是掉进兜底区硬选」正是判断成败的关键。
+    try {
+      const el = fs.readFileSync(path.join(__dirname, 'ow-egress.log'), 'utf8');
+      el.split('\n').filter((l) => /ip-api:|住宅判定通过|兜底区|命中机房品牌|未能拿到/.test(l))
+        .slice(-24).forEach((l) => log('  ' + l.trim()));
+    } catch (e) { /* 无日志不影响主流程 */ }
   }
 
   // ★★★ 2026-10-06：**随机抖动（jitter）** —— 打散「每天同一时刻」的自动化指纹。
