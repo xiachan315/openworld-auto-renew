@@ -77,10 +77,10 @@ echo "[egress] 解析出可用中继 $TOTAL 个"
 #   原因：低延迟 ≠ 住宅。实测选中的 150.40.105.10 是保加利亚机房 `MAXKO d.o.o.`
 #   （AS211619），不在品牌黑名单里 ⇒ 被放行 ⇒ 平台回 `flagged (VPN, proxy)`。
 #   放宽候选数 + 下面的正向判定，才可能在 VPN Gate 的杂牌中继里筛出真住宅出口。
-sort -n /tmp/ow-vg.raw | head -26 > "$CAND"
+sort -n /tmp/ow-vg.raw | head -40 > "$CAND"
 NCAND=$(wc -l < "$CAND")
-# 前 60% 只收「正向判定为住宅」的；剩下的是兜底区（避免整轮颗粒无收）
-RELAX_AFTER=$(( NCAND * 6 / 10 ))
+# 前 80% 只收「正向判定为住宅」的；剩下的是兜底区（避免整轮颗粒无收）
+RELAX_AFTER=$(( NCAND * 8 / 10 ))
 echo "[egress] 取延迟最低的 $NCAND 个逐个尝试（前 $RELAX_AFTER 个要求住宅判定通过）"
 
 prep_ovpn() {
