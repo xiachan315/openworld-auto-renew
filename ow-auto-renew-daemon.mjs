@@ -1451,11 +1451,15 @@ async function doRenew(page) {
       alert: (document.querySelector('.alert,.toast,[role=alert]')?.textContent || '').trim().slice(0, 220),
     };
   });
+  // ★ 2026-10-14 新增：平台可能直接拒掉出口 IP（"network is flagged (proxy)"），
+  //   这种情况必须换出口重试，而不是傻等第二天（run 38558355124 实证）。
+  const FLAGGED = /network is flagged/i.test(res.alert || '');
   return {
-    ok: true, rounds, tokenLen: st.tokenLen,
+    ok: !FLAGGED, rounds, tokenLen: st.tokenLen,
     renewsAfter: res.renews,
     // 服务端冷却话术 = 请求已被受理，只是撞了 24h 限额
     throttled: /only be renewed once every/i.test(res.alert || ''),
+    flagged: FLAGGED,
     alert: res.alert,
   };
 }
@@ -1688,6 +1692,26 @@ async function once() {
 
       r.sessions = si + 1;
 
+      // ★ 2026-10-14 新增：出口 IP 被平台标记为 proxy ⇒ 记住它、换出口、重开会话再试。
+      //   （否则 10 个会话全走同一条 VPN 隧道 = 10 次都撞同一个被封 IP）
+      if (r.flagged) {
+        let cur = '';
+        try { cur = fs.readFileSync('/tmp/ow-egress.ip', 'utf8').trim(); } catch (e) {}
+        if (cur) {
+          let prev = '';
+          try { prev = fs.readFileSync('/tmp/ow-egress.skip', 'utf8'); } catch (e) {}
+          if (!prev.split(/\s+/).includes(cur)) {
+            fs.writeFileSync('/tmp/ow-egress.skip', (prev ? prev + ' ' : '') + cur);
+          }
+          log(`⛔ 出口 IP ${cur} 被平台标记为 proxy ⇒ 加入跳过清单，换出口重试`);
+        }
+        process.env.OW_EGRESS_SKIP = (() => { try { return fs.readFileSync('/tmp/ow-egress.skip', 'utf8').trim(); } catch (e) { return ''; } })();
+        log('重开住宅出口（跳过已标记 IP）...');
+        const eg2 = ensureResidentialEgress();
+        log('  换出口结果:', JSON.stringify(eg2).slice(0, 260));
+        if (!eg2.ok) { log('  换出口失败，本轮放弃'); break; }
+      }
+
       if (r.ok || r.throttled || r.skipped) break;      // 成功/冷却/跳过 ⇒ 无需再试
 
       if (r.rounds && r.rounds.length) log(`会话 ${si + 1} 结束：${r.rounds.length} 阶段（${r.why || '未通过'}），重开会话`);
@@ -1704,6 +1728,7 @@ async function once() {
       const b = info.renews, a = (after && after.renews) || r.renewsAfter || null;
       if (b && a && String(b) === String(a)) { ok2 = false; why2 = 'RENEW_NO_EFFECT'; }
     }
+    if (!ok2 && r.flagged) { ok2 = false; why2 = 'EGRESS_FLAGGED'; }
     return { ...r, ok: ok2, why: why2, hoursLeft: hl, renewsBefore: info.renews, after, cookieLeftDays };
   } finally {
     await browser.close();
