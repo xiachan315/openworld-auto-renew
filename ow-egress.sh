@@ -97,6 +97,10 @@ if openvpn --help 2>&1 | grep -q -- '--providers'; then EXTRA="--providers legac
 echo "[egress] providers 开关: ${EXTRA:-<不支持，跳过>}"
 
 OK=0; TRY=0
+# ★ 2026-10-14 新增：跳过上次被平台标记为 proxy 的出口 IP（空格/逗号分隔）
+SKIP_IPS=" $(echo "${OW_EGRESS_SKIP:-}" | tr ',' ' ' | tr -s ' ') "
+echo "[egress] 跳过清单: [${OW_EGRESS_SKIP:-空}]"
+
 while IFS="	" read -r PING B64 CC; do
   [ -n "${B64:-}" ] || continue
   TRY=$((TRY + 1))
@@ -132,6 +136,11 @@ while IFS="	" read -r PING B64 CC; do
   IP=$(curl -s --max-time 10 https://api.ipify.org 2>/dev/null || true)
   INFO=$(curl -s --max-time 14 "https://ipinfo.io/$IP/json" 2>/dev/null || true)
   [ -n "$IP" ] || continue
+  case "$SKIP_IPS" in
+    *" $IP "*)
+      echo "[egress]   ⏭ $IP 上次被平台标记为 proxy，跳过"
+      continue;;
+  esac
   # ★ 2026-10-09 新增：**正向证据**判定。品牌黑名单（下面那条）只能挡住大厂，
   #   挡不住 MAXKO 这种小机房 ⇒ 必须看情报库的 hosting/proxy 结论。
   #   ip-api.com 免费、无需 key（限 45 次/分钟，够用）。
