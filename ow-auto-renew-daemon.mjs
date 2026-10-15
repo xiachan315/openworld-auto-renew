@@ -1682,7 +1682,18 @@ async function once() {
 
         browser = s.browser; page = s.page;
 
-        await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        // ★ 2026-10-15 新增：换出口后首次导航可能 ERR_ABORTED，重试 3 次
+        let navOk = false;
+        for (let k = 0; k < 3 && !navOk; k++) {
+          try {
+            await page.goto(PANEL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+            navOk = true;
+          } catch (e) {
+            log(`  ⚠️ 第 ${k + 1} 次导航失败（新出口未稳）：${String(e.message).slice(0, 90)}`);
+            await new Promise((r) => setTimeout(r, 10000));
+          }
+        }
+        if (!navOk) { log('  导航反复失败，放弃本轮'); break; }
 
         await page.waitForTimeout(4000);
 
@@ -1710,6 +1721,9 @@ async function once() {
         const eg2 = ensureResidentialEgress();
         log('  换出口结果:', JSON.stringify(eg2).slice(0, 260));
         if (!eg2.ok) { log('  换出口失败，本轮放弃'); break; }
+        // ★ VPN 隧道刚重建，路由/proxy 生效需要时间；立刻开浏览器导航会 net::ERR_ABORTED
+        log('  等待新出口沉降 10s ...');
+        await new Promise((r) => setTimeout(r, 10000));
       }
 
       if (r.ok || r.throttled || r.skipped) break;      // 成功/冷却/跳过 ⇒ 无需再试
