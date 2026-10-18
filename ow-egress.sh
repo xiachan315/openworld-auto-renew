@@ -44,16 +44,35 @@ openvpn --version 2>/dev/null | head -1
 sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
 printf 'vpn\nvpn\n' > "$AUTH"
 
+# ★ 2026-10-18：列表源加固。
+#
+# 事故：run 39128304744（第三次强制续期，跑满 19 分钟）在**第二次**换出口时挂掉：
+#   [egress] 列表源不可用: https://www.vpngate.net/api/iphone/
+#   → 拿不到候选节点 → exit 3 → daemon 打「换出口失败，本轮放弃」。
+#   而同一次 run 开头（同一个源）是**成功的** ⇒ 这不是「源没了」，是**抖动**：
+#   机房出口到 vpngate.net 偶发 DNS/TCP 失败，一次 45s 超时就判定整轮死刑。
+#
+# 对策（只改取列表，不动选节点逻辑）：
+#   1. curl 自带重试：--retry 3 + --retry-connrefused（DNS/TCP 抖动直接靠它吃掉）
+#   2. 外层两轮：第一轮全挂 → 等 20s 再整轮重来（跨过瞬时黑洞）
+#   3. -4 强制 IPv4：runner 上 IPv6 优先时偶发不通，vpnGate 只服务 IPv4
+# 代价：全挂时最坏多花 ~4 分钟，但总比白跑 19 分钟后放弃强。
 fetch_list() {
-  for u in "https://www.vpngate.net/api/iphone/" \
-           "https://vpngate.net/api/iphone/" \
-           "http://www.vpngate.net/api/iphone/"; do
-    if curl -s --max-time 45 -A "Mozilla/5.0" "$u" -o "$LIST" 2>/dev/null; then
-      if [ "$(wc -c < "$LIST" 2>/dev/null || echo 0)" -gt 5000 ]; then
-        echo "[egress] 节点列表来自 $u（$(wc -c < "$LIST") 字节）"; return 0
+  local pass=1
+  while [ "$pass" -le 2 ]; do
+    for u in "https://www.vpngate.net/api/iphone/" \
+             "https://vpngate.net/api/iphone/" \
+             "http://www.vpngate.net/api/iphone/"; do
+      if curl -s -4 --retry 3 --retry-delay 4 --retry-connrefused \
+              --max-time 45 -A "Mozilla/5.0" "$u" -o "$LIST" 2>/dev/null; then
+        if [ "$(wc -c < "$LIST" 2>/dev/null || echo 0)" -gt 5000 ]; then
+          echo "[egress] 节点列表来自 $u（$(wc -c < "$LIST") 字节，第 $pass 轮）"; return 0
+        fi
       fi
-    fi
-    echo "[egress] 列表源不可用: $u"
+      echo "[egress] 列表源不可用: $u（第 $pass 轮）"
+    done
+    pass=$((pass + 1))
+    [ "$pass" -le 2 ] && { echo "[egress] 三个源全挂，20s 后整轮重试"; sleep 20; }
   done
   return 1
 }

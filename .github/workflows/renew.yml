@@ -35,7 +35,13 @@ on:
         default: '0'
 
 permissions:
-  contents: read
+  # ★ 2026-10-18：read → write。
+  #   动机：面板会话 cookie（sessioncookie）只有 7 天且**不滑动**，7 天不跑一次就必然
+  #   COOKIE_EXPIRED（10-17 就是这么挂的）。daemon 现在每轮结束都会把刷新后的整个
+  #   cookie 集重新加密回 ow_cookies.enc（once() 的 finally 块），但留在 runner 的
+  #   工作区里不会自己回仓库 ⇒ 下一轮读到的还是旧快照。给 write 权限，用
+  #   GITHUB_TOKEN 把新 blob 提交回仓库，闭环。
+  contents: write
   actions: write
 
 concurrency:
@@ -177,6 +183,26 @@ jobs:
 
       - name: 跑续期
         run: node ow-auto-renew-daemon.mjs once
+
+      # ★ 2026-10-18：把本轮刷新后的会话 blob 提交回仓库。
+      #   daemon 在 finally 里已把它重写到 ow_cookies.enc；这里只负责「回仓库」。
+      #   · 只在文件真变了时提交（未登录 / 本来最新 ⇒ 不动仓库）
+      #   · continue-on-error：提交失败绝不把一次成功的续期标成失败
+      #   · push 失败最常见的原因是分支保护；真遇到这步会黄，但续期结果不受影响
+      - name: 回写刷新后的会话 blob
+        if: always()
+        continue-on-error: true
+        run: |
+          if git diff --quiet -- ow_cookies.enc; then
+            echo "会话 blob 无变化 ⇒ 跳过提交"
+            exit 0
+          fi
+          git config user.name  "ow-bot"
+          git config user.email "ow-bot@users.noreply.github.com"
+          git add ow_cookies.enc
+          git commit -m "chore: refresh session blob ($(date -u +%F))"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          echo "✅ 已把刷新后的会话 blob 推回 ${GITHUB_REF_NAME}"
 
       - name: 上传诊断截图（仅失败时）
         if: failure()

@@ -1745,6 +1745,38 @@ async function once() {
     if (!ok2 && r.flagged) { ok2 = false; why2 = 'EGRESS_FLAGGED'; }
     return { ...r, ok: ok2, why: why2, hoursLeft: hl, renewsBefore: info.renews, after, cookieLeftDays };
   } finally {
+    // ★ 2026-10-18 新增：把跑完后的 cookie 回写成 ow_cookies.enc。
+    //   动机：面板 sessioncookie 只有 7 天（硬到期、不滑动），而 Clerk 的 __session 有 365 天。
+    //   每次运行都 dump 一次 ⇒ 拿到的既有刷新后的 sessioncookie，也有 Clerk 握手轮换后的新 __session，
+    //   下一轮（以及 workflow 里的回写步骤）就用新的，永远不会踩「7 天后 COOKIE_EXPIRED」。
+    //   只在 LOGIN 正常时写，避免把坏集覆盖上去。
+    //   回写不依赖任何额外权限：OW_COOKIES_B64 本来就在 env 里，加密口径与 loadCookies 完全对称。
+    try {
+      const b64 = process.env.OW_COOKIES_B64;
+      const LOGGED = await page.evaluate(() => !/Sign in|Log in|Redirecting/i.test(document.body.innerText || '')).catch(() => false);
+      if (b64 && LOGGED) {
+        const all = await page.context().cookies();
+        const ow = all.filter((c) => c.domain.indexOf('openworld.eu.org') >= 0);
+        if (ow.length) {
+          const arr = ow.map((c) => ({
+            name: c.name, value: c.value, domain: c.domain, path: c.path || '/',
+            expires: c.expires, httpOnly: !!c.httpOnly, secure: !!c.secure, sameSite: c.sameSite || 'Lax',
+          }));
+          const key = crypto.createHash('sha256').update(b64, 'utf8').digest();
+          const iv = crypto.randomBytes(12);
+          const ci = crypto.createCipheriv('aes-256-gcm', key, iv);
+          const ct = Buffer.concat([ci.update(Buffer.from(JSON.stringify(arr))), ci.final()]);
+          const enc = { v: 1, alg: 'aes-256-gcm', iv: iv.toString('base64'),
+                        tag: ci.getAuthTag().toString('base64'), ct: ct.toString('base64') };
+          fs.writeFileSync(path.join(__dirname, 'ow_cookies.enc'), JSON.stringify(enc));
+          const sc = arr.find((c) => c.name === 'sessioncookie');
+          log('已回写 ow_cookies.enc:', arr.length, '条 · sessioncookie',
+              sc ? `${sc.value.length}B / 剩 ${((sc.expires * 1000 - Date.now()) / 86400000).toFixed(2)}d` : '缺失');
+        }
+      } else {
+        log('跳过 cookie 回写（未登录或缺 OW_COOKIES_B64），不覆盖仓库里的旧集');
+      }
+    } catch (e) { console.warn('cookie 回写失败（不影响结果）:', e.message); }
     await browser.close();
   }
 }
